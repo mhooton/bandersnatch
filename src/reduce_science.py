@@ -5,11 +5,13 @@ from astropy.io import fits
 from master_calibrations import overscan_corr
 from create_lists import write_liste
 
+from utils import clean_bad_pixels
+
 # Set up logger for this module
 logger = logging.getLogger(__name__)
 
 
-def reduce_science_frames(outdir, run, target, to_overscan_correct=False, image_extension=0):
+def reduce_science_frames(outdir, run, target, to_overscan_correct=False, image_extension=0, bad_pixel_map=None):
     logger.info("Starting science frame reduction for target %s", target)
     logger.debug("Parameters: run=%s, overscan_correct=%s, image_ext=%d",
                  run, to_overscan_correct, image_extension)
@@ -108,6 +110,11 @@ def reduce_science_frames(outdir, run, target, to_overscan_correct=False, image_
 
             logger.debug("Applying flat field correction")
             image /= master_flat
+
+            # Apply bad pixel correction if BPM is available
+            if bad_pixel_map is not None:
+                logger.debug("Applying bad pixel correction to %s", filename)
+                image = clean_bad_pixels(image, bad_pixel_map)
 
             final_median = np.median(image)
             logger.debug("Reduction complete: median %.1f -> %.1f", original_median, final_median)

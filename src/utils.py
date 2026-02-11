@@ -2,6 +2,7 @@ import numpy as np
 import os
 import re
 import logging
+from astropy.convolution import interpolate_replace_nans
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
@@ -321,6 +322,20 @@ def find_flat_filters(directory, run):
         logger.error("Failed to scan directory %s: %s", directory, e)
         raise
 
+def clean_bad_pixels(image, bad_pixel_map):
+    """Clean bad pixels by marking as NaN and interpolating"""
+    image = image.copy()
+    image[bad_pixel_map] = np.nan
+    image = interpolate_pixels(image)
+    return image
+
+def interpolate_pixels(frame):
+    """Interpolate NaN pixels using surrounding values"""
+    kernel = np.array([[1, 1, 1],
+                       [1, 0, 1],
+                       [1, 1, 1]])
+    result_frame = interpolate_replace_nans(frame, kernel)
+    return result_frame
 
 if __name__ == "__main__":
     # Set up basic logging for standalone execution

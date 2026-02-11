@@ -10,12 +10,13 @@ import logging
 import logging.handlers
 from pathlib import Path
 import yaml
+from astropy.io import fits
 
 from create_lists import create_lists
 from master_calibrations import make_master_calibration
 from reduce_science import reduce_science_frames
 from utils import find_targets, find_flat_filters
-from astropy.io import fits
+from bad_pixel_map import make_bad_pixel_map
 
 
 def load_config(config_path):
@@ -405,6 +406,11 @@ def parse_arguments():
     parser.add_argument('--no-make-flat', action='store_true',
                         help='Force disable making master flat')
 
+    parser.add_argument('--make-bpm', action='store_true',
+                        help='Force enable making bad pixel map')
+    parser.add_argument('--no-make-bpm', action='store_true',
+                        help='Force disable making bad pixel map')
+
     parser.add_argument('--reduce-science', action='store_true',
                         help='Force enable science frame reduction')
     parser.add_argument('--no-reduce-science', action='store_true',
@@ -498,6 +504,11 @@ def merge_config_with_args(config, args):
         processing_flags['to_make_master_flat'] = True
     elif args.no_make_flat:
         processing_flags['to_make_master_flat'] = False
+
+    if args.make_bpm:
+        processing_flags['to_make_bad_pixel_map'] = True
+    elif args.no_make_bpm:
+        processing_flags['to_make_bad_pixel_map'] = False
 
     if args.reduce_science:
         processing_flags['to_reduce_science_images'] = True
@@ -808,6 +819,31 @@ def main():
             logger.error(f"Failed to create master flats: {e}")
             raise
 
+    # Make bad pixel map
+    if proc_flags.get('to_make_bad_pixel_map', False):
+        logger.info("Creating bad pixel map...")
+        try:
+            bpm = make_bad_pixel_map(outdir, inst_settings['run'], inst_settings['inst'], config)
+            if bpm is not None:
+                logger.info("Bad pixel map created successfully")
+            else:
+                logger.info("Bad pixel map creation skipped (no configuration)")
+                bpm = None
+        except Exception as e:
+            logger.error(f"Failed to create bad pixel map: {e}")
+            raise
+    else:
+        # Try to load existing BPM if it exists
+        bpm_path = caldir / "bad_pixel_map.fits"
+        if bpm_path.exists():
+            logger.info("Loading existing bad pixel map...")
+            with fits.open(bpm_path) as hdul:
+                bpm = hdul[0].data.astype(bool)
+            logger.info("Loaded existing bad pixel map")
+        else:
+            logger.info("No bad pixel map found")
+            bpm = None
+
     # Process science images, centroiding, and photometry
     if (proc_flags['to_reduce_science_images'] or
             proc_flags['to_centroid'] or
@@ -905,7 +941,7 @@ def main():
                     if proc_flags['to_reduce_science_images']:
                         logger.info(f"Performing reduction for target {target}")
                         try:
-                            _ = reduce_science_frames(outdir, inst_settings['run'], target)
+                            _ = reduce_science_frames(outdir, inst_settings['run'], target, bpm)
                             logger.info(f"Science frame reduction completed for {target}")
                         except Exception as e:
                             logger.error(f"Failed to reduce science frames for {target}: {e}")
@@ -927,7 +963,8 @@ def main():
                                      centroid_settings['sky_sigma'],
                                      tracking_star,
                                      centroid_settings['flux_above_value'],
-                                     mask_centroid_pixels=centroid_settings['mask_centroid_pixels'])
+                                     mask_centroid_pixels=centroid_settings['mask_centroid_pixels'],
+                                     bad_pixel_map=bpm)
                             logger.info(f"Centroiding completed for {target}")
                         except Exception as e:
                             logger.error(f"Failed to perform centroiding for {target}: {e}")
@@ -947,7 +984,8 @@ def main():
                                        photometry_settings['aper_max'],
                                        photometry_settings['SKYRAD_inner'],
                                        photometry_settings['SKYRAD_outer'],
-                                       photometry_settings['sky_suppress'])
+                                       photometry_settings['sky_suppress'],
+                                       bad_pixel_map=bpm)
                             logger.info(f"Aperture photometry completed for {target}")
                         except Exception as e:
                             logger.error(f"Failed to perform aperture photometry for {target}: {e}")

@@ -746,8 +746,8 @@ def centroid_loop(star_x_input, star_y_input, boxsize, nlimit_centroid, clip_cen
     }
 
 
-def centroid(outdir, run, target, initial_positions, boxsize, nlimit_centroid, clip_centroid, sky_sigma, tracking_star,
-             flux_above_value, mask_centroid_pixels=False):
+def centroid(outdir, run, target, initial_positions, boxsize, nlimit, clip, sky_sigma,
+             tracking_star, flux_above_value, mask_centroid_pixels=None, bad_pixel_map=None):
     """
     Perform centroiding on all processed images for a given target.
 
@@ -849,6 +849,24 @@ def centroid(outdir, run, target, initial_positions, boxsize, nlimit_centroid, c
                 # Extract AIRMASS - ADD THESE LINES
                 airmass_obs = extract_airmass(header)
 
+                # Count bad pixels in centroid boxes for each star
+                if bad_pixel_map is not None:
+                    n_bad_pixels_in_box = np.zeros(n_stars, dtype=int)
+                    for star_num in range(n_stars):
+                        x_center, y_center = xc_frame[star_num], yc_frame[star_num]
+
+                        # Define box boundaries
+                        x_min = max(0, int(x_center - boxsize / 2))
+                        x_max = min(image.shape[1], int(x_center + boxsize / 2))
+                        y_min = max(0, int(y_center - boxsize / 2))
+                        y_max = min(image.shape[0], int(y_center + boxsize / 2))
+
+                        # Count bad pixels in box
+                        box_bpm = bad_pixel_map[y_min:y_max, x_min:x_max]
+                        n_bad_pixels_in_box[star_num] = np.sum(box_bpm)
+                else:
+                    n_bad_pixels_in_box = np.zeros(n_stars, dtype=int)
+
             # Call centroid_loop for this image
             results = centroid_loop(star_x_input, star_y_input, boxsize, nlimit_centroid,
                                     clip_centroid, sky_sigma, tracking_star, flux_above_value,
@@ -903,6 +921,7 @@ def centroid(outdir, run, target, initial_positions, boxsize, nlimit_centroid, c
         'sig3_pixels': np.array(sig3_pixels),
         'sig5_pixels': np.array(sig5_pixels),
         'sig10_pixels': np.array(sig10_pixels)
+        'n_bad_pixels_in_box': n_bad_pixels_in_box_array
     }
 
     # Create astropy Table
