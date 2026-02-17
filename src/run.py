@@ -426,6 +426,11 @@ def parse_arguments():
     parser.add_argument('--no-photometry', action='store_true',
                         help='Force disable aperture photometry')
 
+    parser.add_argument('--run-analysis', action='store_true',
+                        help='Force enable post-processing analysis and plots')
+    parser.add_argument('--no-run-analysis', action='store_true',
+                        help='Force disable post-processing analysis and plots')
+
     parser.add_argument('--skip-existing-bias', action='store_true',
                         help='Skip creating master bias if it already exists')
     parser.add_argument('--no-skip-existing-bias', action='store_true',
@@ -525,7 +530,12 @@ def merge_config_with_args(config, args):
     elif args.no_photometry:
         processing_flags['to_aperture_photometry'] = False
 
-        # Override skip existing calibration flags if explicitly set
+    if args.run_analysis:
+        processing_flags['to_run_analysis'] = True
+    elif args.no_run_analysis:
+        processing_flags['to_run_analysis'] = False
+
+    # Override skip existing calibration flags if explicitly set
     calib_params = config['calibration_params']
 
     if args.skip_existing_bias:
@@ -822,13 +832,44 @@ def main():
     # Make bad pixel map
     if proc_flags.get('to_make_bad_pixel_map', False):
         logger.info("Creating bad pixel map...")
+
+        # Get preferred filter from config
+        preferred_filter = config.get('bad_pixel_correction', {}).get('preferred_flat_filter', None)
+
+        if preferred_filter is None:
+            logger.error("No preferred_flat_filter specified in date configuration")
+            raise ValueError("preferred_flat_filter must be specified in date configuration for BPM creation")
+
+        logger.info("Using preferred flat filter: %s", preferred_filter)
+
+        # Load required calibration frames
+        bias_file = outdir / 'calib' / f"{inst_settings['run']}_master_bias.fits"
+        dark_file = outdir / 'calib' / f"{inst_settings['run']}_master_dark.fits"
+        flat_file = outdir / 'calib' / f"{inst_settings['run']}_master_flat_{preferred_filter}.fits"
+
+        logger.debug("Loading calibration frames for BPM creation:")
+        logger.debug("  Bias: %s", bias_file)
+        logger.debug("  Dark: %s", dark_file)
+        logger.debug("  Flat: %s", flat_file)
+
         try:
-            bpm = make_bad_pixel_map(outdir, inst_settings['run'], inst_settings['inst'], config)
+            with fits.open(bias_file) as hdul:
+                master_bias = hdul[0].data
+            with fits.open(dark_file) as hdul:
+                master_dark = hdul[0].data
+            with fits.open(flat_file) as hdul:
+                master_flat = hdul[0].data
+
+            # Create BPM with calibration frames
+            bpm = make_bad_pixel_map(outdir, inst_settings['run'],
+                                     master_bias, master_dark, master_flat, config)
+
             if bpm is not None:
                 logger.info("Bad pixel map created successfully")
             else:
                 logger.info("Bad pixel map creation skipped (no configuration)")
                 bpm = None
+
         except Exception as e:
             logger.error(f"Failed to create bad pixel map: {e}")
             raise
@@ -924,6 +965,7 @@ def main():
                         successful_images, failed_images = process_images_streaming(
                             outdir, inst_settings['run'], target, config, calib_frames,
                             initial_position, centroid_params, photometry_params,
+                            bad_pixel_map=bpm,  # ADD THIS LINE
                             save_processed_images=save_processed_images
                         )
                         logger.info(f"Streaming processing completed for {target}: {successful_images} successful")
@@ -1002,6 +1044,69 @@ def main():
             copy_config_files(config_path, None, [], outdir, config)
         except Exception as e:
             logger.warning(f"Failed to copy date config file: {e}")
+
+    # Run post-processing analysis and plots independently
+    if proc_flags.get('to_run_analysis', False):
+        logger.info("Running post-processing analysis and plots...")
+
+        try:
+            all_targets = find_targets(caldir, inst_settings['run'])
+            logger.info("Found targets for analysis: %s", all_targets)
+
+            # Load targets config to resolve which targets to process
+            config_dir = Path(config_path).parent
+            targets_config = load_targets_config(config_dir)
+            targets_to_process, _, _ = resolve_target_positions(config, targets_config, all_targets)
+
+            for target in targets_to_process:
+                logger.info("Running analysis for target %s", target)
+
+                photometry_dir = outdir / target / "photometry"
+
+                if not photometry_dir.exists():
+                    logger.warning("No photometry directory found for target %s, skipping", target)
+                    continue
+
+                # Load existing aperture tables
+                aperture_tables = {}
+                aperture_files = sorted(photometry_dir.glob("photometry_aper*.fits"))
+
+                if not aperture_files:
+                    logger.warning("No photometry files found for target %s, skipping", target)
+                    continue
+
+                logger.info("Loading %d aperture tables for target %s", len(aperture_files), target)
+
+                for aperture_file in aperture_files:
+                    aper_name = aperture_file.stem.replace("photometry_", "")
+                    try:
+                        from astropy.table import Table
+                        aperture_tables[aper_name] = Table.read(aperture_file, format='fits')
+                        logger.debug("Loaded %s", aperture_file.name)
+                    except Exception as e:
+                        logger.error("Failed to load %s: %s", aperture_file.name, e)
+                        continue
+
+                if not aperture_tables:
+                    logger.warning("No aperture tables successfully loaded for %s, skipping", target)
+                    continue
+
+                # Run analysis
+                from photometry_analysis import run_complete_analysis
+                run_complete_analysis(aperture_tables, config, outdir, target,
+                                      photometry_settings['median_filter_window'])
+
+                # Run plots
+                from photometry import create_photometry_plots
+                create_photometry_plots(outdir, target, aperture_tables,
+                                        photometry_settings['median_filter_window'],
+                                        photometry_settings.get('time_bin_size', 0.005))
+
+                logger.info("Analysis completed for target %s", target)
+
+        except Exception as e:
+            logger.error("Failed during post-processing analysis: %s", e)
+            raise
 
     logger.info("=" * 60)
     logger.info("Pipeline completed successfully!")

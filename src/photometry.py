@@ -188,6 +188,20 @@ def photometry(outdir, run, target, config, aper_min, aper_max, SKYRAD_inner, SK
                 silent=True
             )
 
+            # Count bad pixels in apertures
+            if bad_pixel_map is not None:
+                n_bad_pix_aperture = np.zeros((n_apertures, n_stars), dtype=int)
+                for aper_idx, aper_rad in enumerate(apr):
+                    for star_num in range(n_stars):
+                        yy, xx = np.ogrid[:image.shape[0], :image.shape[1]]
+                        circle = (xx - xc_frame[star_num]) ** 2 + (yy - yc_frame[star_num]) ** 2 <= aper_rad ** 2
+                        n_bad_pix_aperture[aper_idx, star_num] = np.sum(bad_pixel_map & circle)
+            else:
+                n_bad_pix_aperture = np.zeros((n_apertures, n_stars), dtype=int)
+
+            # Append to results
+            n_bad_pixels_in_aperture_results.append(n_bad_pix_aperture)
+
             # Convert all outputs from ADU to electrons
             mags_electrons = mags * gain
             errap_electrons = errap * gain
@@ -225,6 +239,8 @@ def photometry(outdir, run, target, config, aper_min, aper_max, SKYRAD_inner, SK
     flux_err_array = np.array(flux_err_results)
     sky_array = np.array(sky_results)  # Shape: (n_images, n_stars)
     sky_err_array = np.array(sky_err_results)
+    n_bad_pixels_in_aperture_array = np.array(
+        n_bad_pixels_in_aperture_results) if n_bad_pixels_in_aperture_results else None
 
     logger.debug("Created flux arrays: flux_shape=%s, sky_shape=%s",
                  flux_array.shape, sky_array.shape)
@@ -239,18 +255,9 @@ def photometry(outdir, run, target, config, aper_min, aper_max, SKYRAD_inner, SK
         aper_name = f"aper{int(aper_radius)}"
         logger.info("Processing aperture %s (%d/%d)", aper_name, aper_idx + 1, n_apertures)
 
-        # Extract data for this aperture
-        flux_this_aper = flux_array[:, aper_idx, :]  # Shape: (n_images, n_stars)
-        flux_err_this_aper = flux_err_array[:, aper_idx, :]
-
-        # Use shared processing function
-        try:
-            aperture_data = process_aperture_photometry(
-                flux_this_aper, flux_err_this_aper, sky_array, sky_err_array,
-                bjd, file_paths, aper_radius, median_filter_window)
-        except Exception as e:
-            logger.error("Failed to process aperture %s: %s", aper_name, e)
-            continue
+        # Convert n_bad_pixels_in_aperture to array
+        n_bad_pix_array = np.array(
+            results['n_bad_pixels_in_aperture']) if 'n_bad_pixels_in_aperture' in results else None
 
         # Create and save table for this aperture
         try:
@@ -266,18 +273,6 @@ def photometry(outdir, run, target, config, aper_min, aper_max, SKYRAD_inner, SK
         except Exception as e:
             logger.error("Failed to save aperture %s table: %s", aper_name, e)
             continue
-
-    logger.info("Running complete photometry analysis")
-    run_complete_analysis(aperture_tables, config, outdir, target, median_filter_window)
-
-    logger.info("Photometry processing complete: %d aperture tables created", len(aperture_tables))
-
-    # 8. Create diagnostic plots
-    try:
-        create_photometry_plots(outdir, target, aperture_tables, median_filter_window, time_bin_size)
-    except Exception as e:
-        logger.error("Failed to create photometry plots: %s", e)
-        # Continue execution even if plots fail
 
     logger.info("Aperture photometry completed successfully for target %s", target)
 

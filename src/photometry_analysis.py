@@ -110,7 +110,8 @@ def median_filter_interpolate(flux_data, outlier_mask, window_size):
 
 
 def process_aperture_photometry(flux_array, flux_err_array, sky_array, sky_err_array,
-                                bjd, file_paths, aper_radius, median_filter_window):
+                                bjd, file_paths, aper_radius, median_filter_window,
+                                n_bad_pixels_in_aperture=None):
     """
     Complete aperture photometry processing pipeline.
 
@@ -164,6 +165,7 @@ def process_aperture_photometry(flux_array, flux_err_array, sky_array, sky_err_a
     bjd_final = bjd[good_frames]
     file_paths_final = [file_paths[i] for i in range(n_images) if good_frames[i]]
     outlier_flags_final = outlier_flags[good_frames]
+    n_bad_pixels_final = n_bad_pixels_in_aperture[good_frames, :] if n_bad_pixels_in_aperture is not None else None
 
     # Step 3: Calculate normalized flux
     flux_norm, flux_norm_err = calculate_normalized_flux(flux_final, flux_err_final)
@@ -203,6 +205,8 @@ def process_aperture_photometry(flux_array, flux_err_array, sky_array, sky_err_a
             outlier_flags_final = outlier_flags_final[secondary_good_frames]
             flux_norm = flux_norm[secondary_good_frames, :]
             flux_norm_err = flux_norm_err[secondary_good_frames, :]
+            n_bad_pixels_final = n_bad_pixels_final[secondary_good_frames,
+                                 :] if n_bad_pixels_final is not None else None
 
         final_std = np.std(diff_flux)
         logger.info("Aperture %s differential photometry: σ=%.6f, %d final points",
@@ -224,6 +228,9 @@ def process_aperture_photometry(flux_array, flux_err_array, sky_array, sky_err_a
         'sky_err': sky_err_final,
         'good_star_mask': good_star_mask_2d
     }
+
+    if n_bad_pixels_final is not None:
+        result['n_bad_pixels_in_aperture'] = n_bad_pixels_final
 
     if diff_flux is not None:
         result['diff_flux'] = diff_flux

@@ -794,6 +794,7 @@ def centroid(outdir, run, target, initial_positions, boxsize, nlimit, clip, sky_
     poststamps = []
     file_paths = []
     bjd = []
+    n_bad_pixels_in_box = []
 
     centroiding_dir = outdir / target / "centroiding"
     os.makedirs(centroiding_dir, exist_ok=True)
@@ -849,23 +850,22 @@ def centroid(outdir, run, target, initial_positions, boxsize, nlimit, clip, sky_
                 # Extract AIRMASS - ADD THESE LINES
                 airmass_obs = extract_airmass(header)
 
-                # Count bad pixels in centroid boxes for each star
                 if bad_pixel_map is not None:
-                    n_bad_pixels_in_box = np.zeros(n_stars, dtype=int)
+                    n_bad_pixels_in_box_frame = np.zeros(n_stars, dtype=int)
                     for star_num in range(n_stars):
-                        x_center, y_center = xc_frame[star_num], yc_frame[star_num]
+                        x_center = star_x_final[star_num]
+                        y_center = star_y_final[star_num]
 
-                        # Define box boundaries
                         x_min = max(0, int(x_center - boxsize / 2))
                         x_max = min(image.shape[1], int(x_center + boxsize / 2))
                         y_min = max(0, int(y_center - boxsize / 2))
                         y_max = min(image.shape[0], int(y_center + boxsize / 2))
 
-                        # Count bad pixels in box
                         box_bpm = bad_pixel_map[y_min:y_max, x_min:x_max]
-                        n_bad_pixels_in_box[star_num] = np.sum(box_bpm)
+                        n_bad_pixels_in_box_frame[star_num] = np.sum(box_bpm)
+                    n_bad_pixels_in_box.append(n_bad_pixels_in_box_frame)
                 else:
-                    n_bad_pixels_in_box = np.zeros(n_stars, dtype=int)
+                    n_bad_pixels_in_box.append(np.zeros(n_stars, dtype=int))
 
             # Call centroid_loop for this image
             results = centroid_loop(star_x_input, star_y_input, boxsize, nlimit_centroid,
@@ -920,8 +920,8 @@ def centroid(outdir, run, target, initial_positions, boxsize, nlimit, clip, sky_
         'n_pixels_above': np.array(n_pixels_above),
         'sig3_pixels': np.array(sig3_pixels),
         'sig5_pixels': np.array(sig5_pixels),
-        'sig10_pixels': np.array(sig10_pixels)
-        'n_bad_pixels_in_box': n_bad_pixels_in_box_array
+        'sig10_pixels': np.array(sig10_pixels),
+        'n_bad_pixels_in_box': np.array(n_bad_pixels_in_box)
     }
 
     # Create astropy Table

@@ -84,9 +84,9 @@ def detect_flatbad_pixels(master_flat, flat_threshold):
     return flatbad_map
 
 
-def make_bad_pixel_map(outdir, run, inst, config):
+def make_bad_pixel_map(outdir, run, master_bias, master_dark, master_flat, config):
     """
-    Create bad pixel map from master calibration files.
+    Create bad pixel map from master calibration frames.
 
     Parameters:
     -----------
@@ -94,8 +94,12 @@ def make_bad_pixel_map(outdir, run, inst, config):
         Output directory containing calibration files
     run : str
         Run identifier
-    inst : str
-        Instrument name
+    master_bias : 2D array
+        Master bias frame
+    master_dark : 2D array
+        Master dark frame
+    master_flat : 2D array
+        Master flat frame (for the preferred filter)
     config : dict
         Configuration dictionary containing instrument settings
 
@@ -104,7 +108,8 @@ def make_bad_pixel_map(outdir, run, inst, config):
     bad_pixel_map : 2D boolean array
         Combined bad pixel map
     """
-    logger.info("Creating bad pixel map for %s", inst)
+    instrument_name = config['instrument_settings']['inst']
+    logger.info("Creating bad pixel map for %s", instrument_name)
 
     # Extract configuration
     inst_config = config['instrument_config']
@@ -118,17 +123,10 @@ def make_bad_pixel_map(outdir, run, inst, config):
     hot_sigma = bpm_config.get('hot_sigma_threshold', 5)
     cold_sigma = bpm_config.get('cold_sigma_threshold', 5)
     flat_threshold = bpm_config.get('flat_threshold', 0.1)
-    preferred_filter = config.get('bad_pixel_correction', {}).get('preferred_flat_filter', None)
     overwrite = bpm_config.get('overwrite_existing', False)
 
     logger.info("BPM parameters: hot_sigma=%.1f, cold_sigma=%.1f, flat_threshold=%.3f",
                 hot_sigma, cold_sigma, flat_threshold)
-
-    if preferred_filter is None:
-        logger.error("No preferred_flat_filter specified in date configuration")
-        raise ValueError("preferred_flat_filter must be specified in date configuration for BPM creation")
-
-    logger.info("Using preferred flat filter: %s", preferred_filter)
 
     # Set up paths
     caldir = outdir / "calib"
@@ -147,63 +145,8 @@ def make_bad_pixel_map(outdir, run, inst, config):
 
         return bad_pixel_map
 
-    # Load master bias
-    bias_path = caldir / f"MasterBias.fits"
-    if not bias_path.exists():
-        logger.error("Master bias not found at %s", bias_path)
-        raise FileNotFoundError(f"Master bias required for BPM creation: {bias_path}")
-
-    logger.debug("Loading master bias from %s", bias_path)
-    with fits.open(bias_path) as hdul:
-        master_bias = hdul[0].data
-
-    # Load master dark (use shortest exposure or combined)
-    dark_files = list(caldir.glob("MasterDark*.fits"))
-    if not dark_files:
-        logger.error("No master dark files found in %s", caldir)
-        raise FileNotFoundError("Master dark required for BPM creation")
-
-    # Try to find shortest exposure dark
-    dark_exposures = []
-    for dark_file in dark_files:
-        if "MasterDark_" in dark_file.name:
-            try:
-                exp_str = dark_file.name.split("_")[1].replace("s.fits", "")
-                exp_time = int(exp_str)
-                dark_exposures.append((exp_time, dark_file))
-            except:
-                pass
-
-    if dark_exposures:
-        # Use shortest exposure dark
-        dark_exposures.sort(key=lambda x: x[0])
-        dark_path = dark_exposures[0][1]
-        logger.info("Using dark with exposure time %ds for BPM creation", dark_exposures[0][0])
-    else:
-        # Use combined dark
-        dark_path = caldir / "MasterDark.fits"
-        if not dark_path.exists():
-            logger.error("No suitable master dark found")
-            raise FileNotFoundError("Master dark required for BPM creation")
-        logger.info("Using combined master dark for BPM creation")
-
-    logger.debug("Loading master dark from %s", dark_path)
-    with fits.open(dark_path) as hdul:
-        master_dark = hdul[0].data
-
     # Subtract bias from dark
     dark_bias_subtracted = master_dark - master_bias
-
-    # Load master flat for preferred filter
-    flat_path = caldir / f"MasterFlat_{preferred_filter}.fits"
-    if not flat_path.exists():
-        logger.error("Master flat for filter '%s' not found at %s", preferred_filter, flat_path)
-        raise FileNotFoundError(f"Master flat for preferred filter '{preferred_filter}' not found. "
-                                f"Cannot create BPM without this flat.")
-
-    logger.debug("Loading master flat from %s", flat_path)
-    with fits.open(flat_path) as hdul:
-        master_flat = hdul[0].data
 
     # Detect hot and cold pixels
     logger.info("Detecting hot and cold pixels...")
@@ -262,15 +205,11 @@ def make_bad_pixel_map(outdir, run, inst, config):
 
     # Save bad pixel map
     hdu = fits.PrimaryHDU(bad_pixel_map.astype(np.uint8))
-    hdu.header['INSTRUME'] = inst
+    hdu.header['INSTRUME'] = instrument_name
     hdu.header['BPMTYPE'] = 'COMBINED'
     hdu.header['HOTSIGMA'] = (hot_sigma, 'Hot pixel sigma threshold')
     hdu.header['COLDSIGM'] = (cold_sigma, 'Cold pixel sigma threshold')
     hdu.header['FLATTHRE'] = (flat_threshold, 'Flat field threshold')
-    hdu.header['FILTER'] = (preferred_filter, 'Filter used for flatbad detection')
-    hdu.header['DARKFILE'] = (dark_path.name, 'Dark file used')
-    hdu.header['FLATFILE'] = (flat_path.name, 'Flat file used')
-    hdu.header['BIASFILE'] = (bias_path.name, 'Bias file used')
 
     hdu.writeto(bpm_path, overwrite=True)
     logger.info("Bad pixel map saved to %s", bpm_path)

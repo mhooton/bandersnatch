@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from astropy.io import fits
 from astropy.table import Table
+from utils import clean_bad_pixels
 
 # Import existing functions
 from reduce_science import overscan_corr
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def process_images_streaming(outdir, run, target, config, calib_frames, initial_positions,
-                             centroid_params, photometry_params, save_processed_images=False):
+                             centroid_params, photometry_params, bad_pixel_map=None, save_processed_images=False):
     """
     Process all images for a target through reduction, centroiding, and photometry in a streaming fashion.
 
@@ -113,7 +114,8 @@ def process_images_streaming(outdir, run, target, config, calib_frames, initial_
             'flux': [],
             'flux_err': [],
             'sky': [],
-            'sky_err': []
+            'sky_err': [],
+            'n_bad_pixels_in_aperture': []
         }
 
     # Create output directories
@@ -154,6 +156,11 @@ def process_images_streaming(outdir, run, target, config, calib_frames, initial_
             image -= calib_frames['bias']
             image -= calib_frames['dark'] * exp_time
             image /= calib_frames['flat']
+
+            # Apply bad pixel correction if BPM is available
+            if bad_pixel_map is not None:
+                logger.debug("Applying bad pixel correction")
+                image = clean_bad_pixels(image, bad_pixel_map)
 
             # Save processed image if requested
             if save_processed_images:
@@ -217,6 +224,17 @@ def process_images_streaming(outdir, run, target, config, calib_frames, initial_
                 silent=True
             )
 
+            # Count bad pixels in apertures
+            if bad_pixel_map is not None:
+                n_bad_pix_aperture = np.zeros((n_apertures, n_stars), dtype=int)
+                for aper_idx, aper_rad in enumerate(apr):
+                    for star_num in range(n_stars):
+                        yy, xx = np.ogrid[:image.shape[0], :image.shape[1]]
+                        circle = (xx - xc_frame[star_num]) ** 2 + (yy - yc_frame[star_num]) ** 2 <= aper_rad ** 2
+                        n_bad_pix_aperture[aper_idx, star_num] = np.sum(bad_pixel_map & circle)
+            else:
+                n_bad_pix_aperture = np.zeros((n_apertures, n_stars), dtype=int)
+
             # Convert to electrons
             mags_electrons = mags * gain
             errap_electrons = errap * gain
@@ -232,6 +250,7 @@ def process_images_streaming(outdir, run, target, config, calib_frames, initial_
                 photometry_results[aper_name]['flux_err'].append(errap_electrons[aper_idx, :])
                 photometry_results[aper_name]['sky'].append(sky_electrons)
                 photometry_results[aper_name]['sky_err'].append(skyerr_electrons)
+                photometry_results[aper_name]['n_bad_pixels_in_aperture'].append(n_bad_pix_aperture[aper_idx, :])
 
             successful_images += 1
 
@@ -348,11 +367,15 @@ def write_photometry_results(photometry_dir, photometry_results, config, target,
         # Extract aperture radius from name (e.g., "aper5" -> 5)
         aper_radius = float(aper_name.replace('aper', ''))
 
+        # Convert n_bad_pixels_in_aperture to array
+        n_bad_pix_array = np.array(
+            results['n_bad_pixels_in_aperture']) if 'n_bad_pixels_in_aperture' in results else None
+
         try:
             # Use shared processing function
             aperture_data = process_aperture_photometry(
                 flux_array, flux_err_array, sky_array, sky_err_array,
-                bjd_array, file_paths_list, aper_radius, median_filter_window)
+                bjd_array, file_paths_list, aper_radius, median_filter_window, n_bad_pixels_in_aperture=n_bad_pix_array)
 
             # Debug: Check data structure
             logger.info("Aperture %s data keys: %s", aper_name, list(aperture_data.keys()))
@@ -377,16 +400,6 @@ def write_photometry_results(photometry_dir, photometry_results, config, target,
             import traceback
             logger.error("Full traceback: %s", traceback.format_exc())
             continue
-
-    # Run complete analysis using the new shared module
-    logger.info("Running complete photometry analysis")
-    run_complete_analysis(aperture_tables, config, outdir, target, median_filter_window)
-
-    # Create diagnostic plots (FIXED: use outdir instead of outdir.parent)
-    try:
-        create_photometry_plots(outdir, target, aperture_tables, median_filter_window, time_bin_size)
-    except Exception as e:
-        logger.error("Failed to create photometry plots: %s", e)
 
 
 def load_calibration_frames(outdir, run, filter_name, calib_params):
