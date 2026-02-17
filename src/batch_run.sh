@@ -166,7 +166,7 @@ parse_args() {
                 COPY_RETRY_INTERVAL="$2"
                 shift 2
                 ;;
-            --skip-existing-bias|--no-skip-existing-bias|--skip-existing-dark|--no-skip-existing-dark|--skip-existing-flat|--no-skip-existing-flat|--skip-existing-lists|--no-skip-existing-lists|--boxsize|--aper-min|--aper-max)
+            --skip-existing-bias|--no-skip-existing-bias|--skip-existing-dark|--no-skip-existing-dark|--skip-existing-flat|--no-skip-existing-flat|--skip-existing-lists|--no-skip-existing-lists|--make-bpm|--no-make-bpm|--run-analysis|--no-run-analysis|--make-lists|--no-make-lists|--make-bias|--no-make-bias|--make-dark|--no-make-dark|--make-flat|--no-make-flat|--reduce-science|--no-reduce-science|--centroid|--no-centroid|--photometry|--no-photometry|--boxsize|--aper-min|--aper-max)
                 PIPELINE_ARGS+=("$1")
                 if [[ "$1" == "--boxsize" || "$1" == "--aper-min" || "$1" == "--aper-max" ]]; then
                     PIPELINE_ARGS+=("$2")

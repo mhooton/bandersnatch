@@ -10,6 +10,37 @@ from utils import clean_bad_pixels
 # Set up logger for this module
 logger = logging.getLogger(__name__)
 
+def apply_calibrations(image, master_bias, master_dark, master_flat, exptime, bad_pixel_map=None):
+    """
+    Apply bias, dark, and flat calibrations to a single image.
+
+    Parameters:
+    -----------
+    image : np.ndarray
+        Raw 2D image array (float64)
+    master_bias : np.ndarray
+        Master bias frame
+    master_dark : np.ndarray
+        Master dark frame (per-second rate)
+    master_flat : np.ndarray
+        Normalised master flat field
+    exptime : float
+        Exposure time in seconds
+    bad_pixel_map : np.ndarray or None
+        Boolean bad pixel map (True = bad). If provided, bad pixels are interpolated.
+
+    Returns:
+    --------
+    np.ndarray : Calibrated image
+    """
+    calibrated = image - master_bias
+    calibrated -= master_dark * exptime
+    calibrated /= master_flat
+
+    if bad_pixel_map is not None:
+        calibrated = clean_bad_pixels(calibrated, bad_pixel_map)
+
+    return calibrated
 
 def reduce_science_frames(outdir, run, target, to_overscan_correct=False, image_extension=0, bad_pixel_map=None):
     logger.info("Starting science frame reduction for target %s", target)
@@ -102,19 +133,8 @@ def reduce_science_frames(outdir, run, target, to_overscan_correct=False, image_
                 logger.debug("Applying overscan correction")
                 image = overscan_corr(image)
 
-            logger.debug("Applying bias correction")
-            image -= master_bias
-
-            logger.debug("Applying dark correction (scaled by exp_time=%.2f)", exp_time)
-            image -= master_dark * exp_time
-
-            logger.debug("Applying flat field correction")
-            image /= master_flat
-
-            # Apply bad pixel correction if BPM is available
-            if bad_pixel_map is not None:
-                logger.debug("Applying bad pixel correction to %s", filename)
-                image = clean_bad_pixels(image, bad_pixel_map)
+            image = apply_calibrations(image, master_bias, master_dark, master_flat,
+                                       exp_time, bad_pixel_map)
 
             final_median = np.median(image)
             logger.debug("Reduction complete: median %.1f -> %.1f", original_median, final_median)

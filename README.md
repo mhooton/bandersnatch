@@ -139,9 +139,11 @@ processing_flags:
   to_make_master_bias: true         # Create master bias frame
   to_make_master_dark: true         # Create master dark frame
   to_make_master_flat: true         # Create master flat fields
+  to_make_bad_pixel_map: false      # Create bad pixel map from calibrations
   to_reduce_science_images: true    # Apply calibrations to science frames
   to_centroid: true                 # Perform centroiding
   to_aperture_photometry: true      # Perform aperture photometry
+  to_run_analysis: true             # Run precision analysis and diagnostic plots
 
 calibration_params:
   image_extension: 0           # FITS extension containing image data
@@ -654,7 +656,7 @@ calibration_params:
 reduced = (raw - bias - dark×exp_time) / flat
 ```
 
-**Note**: With **streaming processing** enabled (all three flags: reduce + centroid + photometry), processed images are NOT saved to disk by default. Set `save_processed_images_streaming: true` to save them.
+**Note**: With **streaming processing** enabled (all three flags: reduce + centroid + photometry), processed images are NOT saved to disk by default. Set `save_processed_images_streaming: true` to save them. Precision analysis and diagnostic plots require `to_run_analysis: true` as a separate step.
 
 ### 6. Centroiding (`to_centroid`)
 
@@ -796,6 +798,49 @@ photometry_settings:
 # ...
 ```
 
+### 8. Post-Processing Analysis (`to_run_analysis`)
+
+**What it does**: Runs precision analysis and generates diagnostic plots independently of the photometry extraction step.
+
+**When to use**: This flag is independent of the photometry extraction. It can be re-run without re-extracting photometry — useful for regenerating plots or recalculating precision metrics after adjusting parameters.
+
+**Inputs**:
+- Existing `photometry_aper{N}.fits` files from a previous photometry run
+- Instrument config (gain, scintillation parameters)
+- Calibration diagnostics (readout noise, dark current)
+
+**Outputs**:
+~/bandersnatch_runs/{RUN_NAME}/{TARGET}/photometry/
+├── differential_summary.txt       # Best aperture, precision metrics
+├── precision_metrics.fits         # Detailed table for all apertures/stars
+└── plots/                         # Light curves and diagnostics
+├── diff_flux_aper{N}.png
+├── flux_aper{N}_all_stars.png
+├── flux_norm_aper{N}star{N}.png
+└── sky_all_stars.png
+
+**Algorithm**:
+1. Load all existing `photometry_aper{N}.fits` tables
+2. Calculate theoretical precision (photon noise, scintillation, sky, readout, dark)
+3. Calculate observed precision (rolling 10-minute window)
+4. Create summary files (`differential_summary.txt`, `precision_metrics.fits`)
+5. Generate diagnostic plots
+
+**Note**: Neither the streaming nor the traditional photometry extraction path runs analysis or generates plots automatically. You **must** set `to_run_analysis: true` to get precision metrics and diagnostic plots.
+
+**Reprocessing example** (just regenerate analysis and plots):
+```bash
+python src/run.py 20251215.yaml \
+  --no-make-lists \
+  --no-make-bias \
+  --no-make-dark \
+  --no-make-flat \
+  --no-reduce-science \
+  --no-centroid \
+  --no-photometry \
+  --run-analysis
+```
+
 ## Output Structure
 
 ### Calibration Outputs
@@ -924,7 +969,9 @@ processing_flags:
 - Reduces disk I/O (doesn't write/read intermediate processed images)
 - Lower memory footprint
 - Faster processing
-- Still produces identical outputs
+- Produces identical photometry tables to traditional processing
+
+**Note**: Streaming processing extracts photometry but does not run precision analysis or generate diagnostic plots. Set `to_run_analysis: true` to run these as a separate step after extraction.
 
 **Optionally save processed images**:
 ```yaml

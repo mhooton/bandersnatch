@@ -652,6 +652,55 @@ def create_centroiding_plots(centroiding_dir):
     except Exception as e:
         logger.error("Failed to create centroiding plots: %s", e)
 
+def write_centroiding_results(centroiding_dir, centroid_results, all_poststamps, n_stars, boxsize):
+    """
+    Write centroiding results to disk as a FITS table and per-star poststamp cubes.
+
+    Parameters:
+    -----------
+    centroiding_dir : Path
+        Output directory for centroiding results
+    centroid_results : dict
+        Dictionary of result lists/arrays (BJD, File, xc, yc, etc.)
+    all_poststamps : list
+        List of poststamp arrays, one per image
+    n_stars : int
+        Number of stars
+    boxsize : int
+        Half-width of poststamp box
+    """
+    os.makedirs(centroiding_dir, exist_ok=True)
+
+    # Create plots directory
+    plots_dir = centroiding_dir / "plots"
+    os.makedirs(plots_dir, exist_ok=True)
+
+    # Create and write centroids table
+    centroid_table = Table(centroid_results)
+    centroids_path = centroiding_dir / "centroids.fits"
+    centroid_table.write(centroids_path, format='fits', overwrite=True)
+    logger.info("Centroids table saved to %s", centroids_path)
+
+    # Write poststamps for each star
+    logger.info("Writing poststamps for %d stars", n_stars)
+    poststamps_array = np.array(all_poststamps)  # Shape: (n_images, 2*boxsize+1, 2*boxsize+1, n_stars)
+
+    for star_num in range(n_stars):
+        try:
+            star_poststamps = poststamps_array[:, :, :, star_num]
+            poststamp_path = centroiding_dir / f"poststamps_{star_num}.fits"
+            fits.writeto(poststamp_path, star_poststamps, overwrite=True)
+            logger.debug("Poststamps for star %d saved to %s (shape: %s)",
+                         star_num, poststamp_path, star_poststamps.shape)
+        except Exception as e:
+            logger.error("Failed to save poststamps for star %d: %s", star_num, e)
+
+    # Create diagnostic plots
+    try:
+        create_centroiding_plots(centroiding_dir)
+        logger.info("Centroiding diagnostic plots created")
+    except Exception as e:
+        logger.error("Failed to create centroiding plots: %s", e)
 
 def centroid_loop(star_x_input, star_y_input, boxsize, nlimit_centroid, clip_centroid, sky_sigma,
                   tracking_star, flux_above_value, image=None, fk5=False, header=None,
@@ -851,10 +900,10 @@ def centroid(outdir, run, target, initial_positions, boxsize, nlimit, clip, sky_
                 airmass_obs = extract_airmass(header)
 
                 if bad_pixel_map is not None:
-                    n_bad_pixels_in_box_frame = np.zeros(n_stars, dtype=int)
-                    for star_num in range(n_stars):
-                        x_center = star_x_final[star_num]
-                        y_center = star_y_final[star_num]
+                    n_bad_pixels_in_box_frame = np.zeros(len(star_x_input), dtype=int)
+                    for star_num in range(len(star_x_input)):
+                        x_center = results['xc'][star_num]
+                        y_center = results['yc'][star_num]
 
                         x_min = max(0, int(x_center - boxsize / 2))
                         x_max = min(image.shape[1], int(x_center + boxsize / 2))
@@ -865,11 +914,11 @@ def centroid(outdir, run, target, initial_positions, boxsize, nlimit, clip, sky_
                         n_bad_pixels_in_box_frame[star_num] = np.sum(box_bpm)
                     n_bad_pixels_in_box.append(n_bad_pixels_in_box_frame)
                 else:
-                    n_bad_pixels_in_box.append(np.zeros(n_stars, dtype=int))
+                    n_bad_pixels_in_box.append(np.zeros(len(star_x_input), dtype=int))
 
             # Call centroid_loop for this image
-            results = centroid_loop(star_x_input, star_y_input, boxsize, nlimit_centroid,
-                                    clip_centroid, sky_sigma, tracking_star, flux_above_value,
+            results = centroid_loop(star_x_input, star_y_input, boxsize, nlimit,
+                                    clip, sky_sigma, tracking_star, flux_above_value,
                                     image=image, header=header, mask_centroid_pixels=mask_centroid_pixels)
 
             # Append results to lists
@@ -902,14 +951,11 @@ def centroid(outdir, run, target, initial_positions, boxsize, nlimit, clip, sky_
         logger.error("No images were successfully processed for centroiding")
         raise RuntimeError("No images were successfully processed for centroiding")
 
-    # 5. Create FITS table with one row per image
-    logger.info("Creating centroids table with %d observations", len(xc))
-
-    # Convert lists to numpy arrays
-    table_data = {
+    # 5. Build results dictionary and write to disk
+    centroid_results = {
         'BJD': np.array(bjd),
         'File': file_paths,
-        'airmass': np.array(airmass),  # ADD THIS LINE
+        'airmass': np.array(airmass),
         'xc': np.array(xc),
         'yc': np.array(yc),
         'x_bright': np.array(x_bright),
@@ -924,45 +970,8 @@ def centroid(outdir, run, target, initial_positions, boxsize, nlimit, clip, sky_
         'n_bad_pixels_in_box': np.array(n_bad_pixels_in_box)
     }
 
-    # Create astropy Table
-    centroid_table = Table(table_data)
-    logger.debug("Created table with columns: %s", list(centroid_table.colnames))
-
-    # Create and save poststamps data cubes for each star
-    logger.info("Saving poststamps for %d stars", len(star_x_input))
-    poststamps_array = np.array(poststamps)  # Shape: (n_images, 2*boxsize+1, 2*boxsize+1, n_stars)
-
-    n_stars = len(star_x_input)
-
-    for star_num in range(n_stars):
-        try:
-            # Extract poststamps for this star: (n_images, 2*boxsize+1, 2*boxsize+1)
-            star_poststamps = poststamps_array[:, :, :, star_num]
-
-            # Create and write FITS image file for this star's poststamps
-            poststamp_path = centroiding_dir / f"poststamps_{star_num}.fits"
-            fits.writeto(poststamp_path, star_poststamps, overwrite=True)
-
-            logger.debug("Poststamps for star %d saved to %s (shape: %s)",
-                         star_num, poststamp_path, star_poststamps.shape)
-
-        except Exception as e:
-            logger.error("Failed to save poststamps for star %d: %s", star_num, e)
-
-    # 6. Write centroids table
-    try:
-        centroid_table.write(structure_path, format='fits', overwrite=True)
-        logger.info("Centroids table saved to %s", structure_path)
-    except Exception as e:
-        logger.error("Failed to save centroids table: %s", e)
-        raise
-
-    # Create diagnostic plots
-    try:
-        create_centroiding_plots(centroiding_dir)
-    except Exception as e:
-        logger.error("Failed to create diagnostic plots: %s", e)
-        # Continue execution even if plots fail
+    write_centroiding_results(centroiding_dir, centroid_results, poststamps,
+                              len(star_x_input), boxsize)
 
     logger.info("Centroiding completed successfully for target %s", target)
     logger.info("Results saved to %s", centroiding_dir)

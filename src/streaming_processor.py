@@ -6,14 +6,12 @@ import logging
 from pathlib import Path
 from astropy.io import fits
 from astropy.table import Table
-from utils import clean_bad_pixels
 
 # Import existing functions
-from reduce_science import overscan_corr
-from centroid import centroid_loop, extract_airmass
-from photometry import translate_path_for_docker
+from reduce_science import overscan_corr, apply_calibrations
+from centroid import centroid_loop, extract_airmass, write_centroiding_results
+from photometry import translate_path_for_docker, count_bad_pixels_in_apertures, write_photometry_results
 from aper import aper
-from photometry_analysis import process_aperture_photometry
 
 logger = logging.getLogger(__name__)
 
@@ -149,18 +147,12 @@ def process_images_streaming(outdir, run, target, config, calib_frames, initial_
                 # Extract AIRMASS - ADD THESE LINES
                 airmass_obs = extract_airmass(header)
 
-            # Apply calibrations (same as reduce_science.py)
+            # Apply calibrations
             if config.get('to_overscan_correct', False):
                 image = overscan_corr(image)
 
-            image -= calib_frames['bias']
-            image -= calib_frames['dark'] * exp_time
-            image /= calib_frames['flat']
-
-            # Apply bad pixel correction if BPM is available
-            if bad_pixel_map is not None:
-                logger.debug("Applying bad pixel correction")
-                image = clean_bad_pixels(image, bad_pixel_map)
+            image = apply_calibrations(image, calib_frames['bias'], calib_frames['dark'],
+                                       calib_frames['flat'], exp_time, bad_pixel_map)
 
             # Save processed image if requested
             if save_processed_images:
@@ -225,15 +217,8 @@ def process_images_streaming(outdir, run, target, config, calib_frames, initial_
             )
 
             # Count bad pixels in apertures
-            if bad_pixel_map is not None:
-                n_bad_pix_aperture = np.zeros((n_apertures, n_stars), dtype=int)
-                for aper_idx, aper_rad in enumerate(apr):
-                    for star_num in range(n_stars):
-                        yy, xx = np.ogrid[:image.shape[0], :image.shape[1]]
-                        circle = (xx - xc_frame[star_num]) ** 2 + (yy - yc_frame[star_num]) ** 2 <= aper_rad ** 2
-                        n_bad_pix_aperture[aper_idx, star_num] = np.sum(bad_pixel_map & circle)
-            else:
-                n_bad_pix_aperture = np.zeros((n_apertures, n_stars), dtype=int)
+            n_bad_pix_aperture = count_bad_pixels_in_apertures(
+                bad_pixel_map, image.shape, xc_frame, yc_frame, apr, n_stars)
 
             # Convert to electrons
             mags_electrons = mags * gain
@@ -291,116 +276,13 @@ def process_images_streaming(outdir, run, target, config, calib_frames, initial_
 
     # Write photometry results
     logger.info("Writing photometry results")
-    write_photometry_results(photometry_dir, photometry_results, config, target, outdir)
+    median_filter_window = config.get('photometry_settings', {}).get('median_filter_window', 21)
+    write_photometry_results(photometry_dir, photometry_results, config, target, outdir,
+                             median_filter_window)
 
     logger.info("All results written successfully")
 
     return successful_images, failed_images
-
-
-def write_centroiding_results(centroiding_dir, centroid_results, all_poststamps, n_stars, boxsize):
-    """Write centroiding results to disk in the same format as centroid.py."""
-
-    # Create centroids table
-    centroid_table = Table(centroid_results)
-
-    # Write centroids table
-    centroids_path = centroiding_dir / "centroids.fits"
-    centroid_table.write(centroids_path, format='fits', overwrite=True)
-    logger.info("Centroids table saved to %s", centroids_path)
-
-    # Write poststamps for each star (matching centroid.py format)
-    logger.info("Writing poststamps for %d stars", n_stars)
-    poststamps_array = np.array(all_poststamps)  # Shape: (n_images, 2*boxsize+1, 2*boxsize+1, n_stars)
-
-    for star_num in range(n_stars):
-        try:
-            # Extract poststamps for this star: (n_images, 2*boxsize+1, 2*boxsize+1)
-            star_poststamps = poststamps_array[:, :, :, star_num]
-
-            # Create and write FITS image file for this star's poststamps
-            poststamp_path = centroiding_dir / f"poststamps_{star_num}.fits"
-            fits.writeto(poststamp_path, star_poststamps, overwrite=True)
-
-            logger.debug("Poststamps for star %d saved to %s (shape: %s)",
-                         star_num, poststamp_path, star_poststamps.shape)
-
-        except Exception as e:
-            logger.error("Failed to save poststamps for star %d: %s", star_num, e)
-
-    # Create diagnostic plots
-    try:
-        from centroid import create_centroiding_plots
-        create_centroiding_plots(centroiding_dir)
-        logger.info("Centroiding diagnostic plots created")
-    except Exception as e:
-        logger.error("Failed to create centroiding plots: %s", e)
-
-
-def write_photometry_results(photometry_dir, photometry_results, config, target, outdir):
-    """Write photometry results and perform time-series analysis."""
-
-    # Import the time-series analysis functions from photometry.py
-    from photometry import create_photometry_plots
-    # Import the new analysis module
-    from photometry_analysis import run_complete_analysis
-
-    # Extract parameters
-    median_filter_window = 21  # Could be made configurable
-    time_bin_size = 0.005
-
-    # Convert results to the format expected by existing analysis code
-    aperture_tables = {}
-
-    for aper_name, results in photometry_results.items():
-        if not results['BJD']:  # Skip empty results
-            continue
-
-        # Convert lists to numpy arrays
-        bjd_array = np.array(results['BJD'])
-        file_paths_list = results['File']
-        flux_array = np.array(results['flux'])  # Shape: (n_images, n_stars)
-        flux_err_array = np.array(results['flux_err'])
-        sky_array = np.array(results['sky'])
-        sky_err_array = np.array(results['sky_err'])
-
-        # Extract aperture radius from name (e.g., "aper5" -> 5)
-        aper_radius = float(aper_name.replace('aper', ''))
-
-        # Convert n_bad_pixels_in_aperture to array
-        n_bad_pix_array = np.array(
-            results['n_bad_pixels_in_aperture']) if 'n_bad_pixels_in_aperture' in results else None
-
-        try:
-            # Use shared processing function
-            aperture_data = process_aperture_photometry(
-                flux_array, flux_err_array, sky_array, sky_err_array,
-                bjd_array, file_paths_list, aper_radius, median_filter_window, n_bad_pixels_in_aperture=n_bad_pix_array)
-
-            # Debug: Check data structure
-            logger.info("Aperture %s data keys: %s", aper_name, list(aperture_data.keys()))
-            for key, value in aperture_data.items():
-                if hasattr(value, '__len__') and not isinstance(value, str):
-                    logger.info("  %s: length %d, type %s", key, len(value), type(value).__name__)
-                elif hasattr(value, 'shape'):
-                    logger.info("  %s: shape %s, type %s", key, value.shape, type(value).__name__)
-                else:
-                    logger.info("  %s: scalar value, type %s", key, type(value).__name__)
-
-            # Create table
-            aperture_table = Table(aperture_data)
-            output_path = photometry_dir / f"photometry_{aper_name}.fits"
-            aperture_table.write(output_path, format='fits', overwrite=True)
-
-            aperture_tables[aper_name] = aperture_table
-            logger.info("Aperture %s results saved to %s", aper_name, output_path)
-
-        except Exception as e:
-            logger.error("Failed to process aperture %s: %s", aper_name, e)
-            import traceback
-            logger.error("Full traceback: %s", traceback.format_exc())
-            continue
-
 
 def load_calibration_frames(outdir, run, filter_name, calib_params):
     """Load master calibration frames into memory."""
