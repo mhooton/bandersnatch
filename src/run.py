@@ -379,12 +379,6 @@ def parse_arguments():
     parser.add_argument('--inst', help='Override instrument name')
     parser.add_argument('--run', help='Override run number')
 
-    # Staging options
-    parser.add_argument('--local-staging', action='store_true',
-                        help='Use local staging directory for processing')
-    parser.add_argument('--staging-dir',
-                        help='Local staging directory path')
-
     # Processing step flags - use separate attributes to avoid conflicts
     parser.add_argument('--make-lists', action='store_true',
                         help='Force enable making file lists')
@@ -584,27 +578,14 @@ def merge_config_with_args(config, args):
     return config
 
 
-def setup_paths(config, is_docker, use_local_staging=False, local_staging_dir=None):
-    """Set up paths based on environment and staging configuration."""
+def setup_paths(config):
+    """Set up paths based on topdir from config file."""
     inst_settings = config['instrument_settings']
     path_settings = config['paths']
 
-    if is_docker:
-        # Docker paths remain the same
-        topdir = Path("/app")
-        rawdir = topdir / "data" / inst_settings['inst'] / inst_settings['date']
-        outdir = topdir / "output" / inst_settings['run_name']
-    elif use_local_staging and local_staging_dir:
-        # Local staging paths
-        staging_base = Path(local_staging_dir)
-        topdir = staging_base
-        rawdir = staging_base / "data" / inst_settings['inst'] / inst_settings['date']
-        outdir = staging_base / "bandersnatch_runs" / inst_settings['run_name']
-    else:
-        # Original local conda environment paths
-        topdir = Path(path_settings['topdir']).expanduser()
-        rawdir = topdir / "data" / inst_settings['inst'] / inst_settings['date']
-        outdir = topdir / "bandersnatch_runs" / inst_settings['run_name']
+    topdir = Path(path_settings['topdir']).expanduser()
+    rawdir = topdir / "Observations" / inst_settings['inst'] / "images" / inst_settings['date']
+    outdir = topdir / "bandersnatch_runs" / inst_settings['run_name']
 
     return topdir, rawdir, outdir
 
@@ -612,9 +593,6 @@ def setup_paths(config, is_docker, use_local_staging=False, local_staging_dir=No
 def main():
     """Main pipeline execution function."""
     args = parse_arguments()
-
-    # Detect if running in Docker container
-    is_docker = os.environ.get('RUNNING_IN_DOCKER', 'false').lower() == 'true'
 
     # Handle config file path resolution
     config_path = Path(args.config)
@@ -627,8 +605,6 @@ def main():
 
         # Try to find topdir from common locations or use default
         potential_topdirs = [
-            Path("/Volumes/ARC_reborn"),
-            Path("/Users/matthewhooton"),  # Your current setup
             Path.home(),
             Path.cwd()
         ]
@@ -671,7 +647,7 @@ def main():
     # path_settings = config['paths']
 
     # Set up paths with staging support
-    topdir, rawdir, outdir = setup_paths(config, is_docker, args.local_staging, args.staging_dir)
+    topdir, rawdir, outdir = setup_paths(config)
 
     caldir = outdir / "calib"
 

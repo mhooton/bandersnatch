@@ -63,13 +63,14 @@ python src/run.py --help
 
 The pipeline expects and creates the following directory structure:
 ```
-~/                                    # Your home directory (topdir)
-├── data/                            # Raw telescope data
+{topdir}/                             # Base directory (set in config)
+├── Observations/                    # Raw telescope data
 │   └── {INSTRUMENT}/
-│       └── {YYYYMMDD}/
-│           ├── file001.fits
-│           ├── file002.fits
-│           └── ...
+│       └── images/
+│           └── {YYYYMMDD}/
+│               ├── file001.fits
+│               ├── file002.fits
+│               └── ...
 │
 ├── bandersnatch_runs/               # Pipeline outputs
 │   ├── configs/                     # Configuration files
@@ -192,7 +193,7 @@ photometry_settings:
   sky_suppress: false          # Force sky to near-zero (for testing)
 
 paths:
-  topdir: "/Users/matthewhooton"  # Base directory (usually home directory)
+  topdir: "/data/SPECULOOSPipeline"  # Server path, or local mirror e.g. "/Volumes/my_drive"
 
 # Optional: advanced streaming settings
 save_processed_images_streaming: false  # Save intermediate processed images
@@ -309,7 +310,7 @@ The pipeline will:
 ```bash
 conda activate bandersnatch
 cd /path/to/bandersnatch
-python src/run.py ~/bandersnatch_runs/configs/20251215.yaml
+python src/run.py {topdir}/bandersnatch_runs/configs/20251215.yaml
 ```
 
 This will:
