@@ -370,6 +370,32 @@ class Instrument:
 
     # -- convenience -------------------------------------------------------
 
+    def legacy_config(self) -> dict:
+        """The instrument config with per-detector values resolved.
+
+        Modules that predate this class read ``config['instrument_config']``
+        and expect flat ``gain``, ``phpadu``, ``read_noise`` keys. A
+        multi-detector instrument has no single value for those, so the
+        selected detector's are filled in here. Without this a WFC run reaches
+        the analysis stage and fails on a missing 'gain'.
+        """
+        merged = dict(self.config)
+        merged.update(
+            instrument_name=self.name,
+            detector=self.detector.name,
+            gain=self.detector.gain,
+            phpadu=self.detector.phpadu,
+        )
+        if self.detector.read_noise is not None:
+            merged["read_noise"] = self.detector.read_noise
+        if self.detector.saturation is not None:
+            merged["saturation_threshold"] = self.detector.saturation
+        if self.plate_scale is not None:
+            merged["plate_scale"] = self.plate_scale
+        if self.observatory_cfg and "observatory_altitude" not in merged:
+            merged["observatory_altitude"] = self.observatory_cfg.get("height", 0.0)
+        return merged
+
     def gain(self) -> float:
         return self.detector.gain
 

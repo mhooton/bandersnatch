@@ -114,7 +114,7 @@ def make_bad_pixel_map(outdir, run, master_bias, master_dark, master_flat, confi
     logger.info("Creating bad pixel map for %s", instrument_name)
 
     # Extract configuration
-    inst_config = (instrument.config if instrument is not None
+    inst_config = (instrument.legacy_config() if instrument is not None
                    else config['instrument_config'])
     bpm_config = inst_config.get('bad_pixel_correction', None)
 

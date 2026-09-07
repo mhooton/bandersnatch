@@ -127,7 +127,7 @@ def build_instrument(config, config_dir):
             "calibration_params.image_extension is deprecated; declare the HDU "
             "under 'detectors' in %s.yaml instead", inst_settings['inst'])
         config['_ext_warned'] = True
-    config['instrument_config'] = instrument.config
+    config['instrument_config'] = instrument.legacy_config()
     return instrument
 
 

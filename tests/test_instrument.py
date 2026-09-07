@@ -38,7 +38,7 @@ WFC_CFG = {
                  "overscan": "[146:160,1:200]", "gain": 2.8, "read_noise": 6.4},
         "CCD4": {"hdu": "extension4", "trim": "[11:140,1:200]",
                  "overscan": "[146:160,1:200]", "gain": 2.9, "read_noise": 5.8,
-                 "bad_columns": [77]},
+                 "saturation": 65535, "bad_columns": [77]},
     },
     "default_detector": "CCD4",
     "coordinates": "raw",
@@ -724,3 +724,26 @@ def test_large_scale_preserves_shape(shape):
     rng = np.random.default_rng(23)
     img = rng.normal(0, 1, shape)
     assert reduction.large_scale(img, 120).shape == shape
+
+
+def test_legacy_config_resolves_per_detector_values():
+    """Modules predating Instrument read flat gain/phpadu keys."""
+    inst = Instrument(WFC_CFG)                       # CCD4, gain 2.9
+    legacy = inst.legacy_config()
+    assert legacy["gain"] == 2.9
+    assert legacy["read_noise"] == 5.8
+    assert legacy["detector"] == "CCD4"
+    assert legacy["saturation_threshold"] == 65535
+    # the multi-detector block is still there for anything that wants it
+    assert set(legacy["detectors"]) == {"CCD1", "CCD4"}
+
+    one = Instrument(WFC_CFG, detector_name="CCD1").legacy_config()
+    assert one["gain"] == 2.8 and one["read_noise"] == 6.4
+    # CCD1 declares no saturation, so no stale value is carried over
+    assert "saturation_threshold" not in one
+
+
+def test_legacy_config_passes_through_a_single_detector_instrument():
+    legacy = Instrument(SPEC_CFG).legacy_config()
+    assert legacy["gain"] == 1.6
+    assert legacy["phpadu"] == 1.0

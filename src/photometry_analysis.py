@@ -523,7 +523,8 @@ def calculate_precision_metrics(aperture_tables, config, outdir, target):
     gain = config['instrument_config']['gain']
     telescope_diameter = config['instrument_config']['telescope_diameter']
     observatory_altitude = config['instrument_config']['observatory_altitude']
-    scint_params = config['instrument_config']['scintillation']
+    scint_params = config['instrument_config'].get(
+        'scintillation', {'C_Y': 1.56, 'H': 8000})
 
     # Read calibration files
     calib_dir = outdir / 'calib'
