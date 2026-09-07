@@ -671,3 +671,65 @@ Recommended, proceeding unless corrected:
    hardcoded plate scale and instrument name at the same time.
 
 No open questions remain. Implementation can proceed through section 9.
+
+---
+
+## 11. As built
+
+Implemented September 2026 on branch `wfc-instrument-abstraction`. The design
+above was followed; this section records where the implementation went beyond
+it, and why.
+
+### Verification
+
+- **68 unit tests** in `tests/test_instrument.py`, covering FITS section
+  parsing, keyword resolution and expressions, classification rule order, the
+  detector selection and header merge, time conversion, step-order validation,
+  the raw-to-trimmed coordinate conversion, dated-entry lookup, the reduction
+  chain, fringe fitting and map construction, fringe-map provenance refusal,
+  and the clipped stack combination.
+- **Regression**: `tests/make_synthetic_night.py` generates a deterministic
+  synthetic night in SPECULOOS and INT/WFC flavours. A full run on the
+  SPECULOOS flavour was captured before any change and compared after. Master
+  bias, master dark, master flat, bad pixel map, centroids and six aperture
+  tables agree to float64 rounding: at worst 2e-15 relative in any table
+  column and 4e-16 absolute in any master frame, against a float64 epsilon of
+  2.2e-16. The only source of that difference is summation order in the
+  vectorised stack combination.
+- **INT/WFC end to end**: the real night of 2017-08-05, 514 frames, chip 4.
+
+### Beyond the design
+
+**Performance work, forced by frame size.** A WFC chip is 8.4 megapixels
+against SPIRIT's 0.26, and three separate costs only became visible at that
+scale:
+
+- `medabsdevclip` looped in Python over every pixel, at four minutes per
+  master frame. Vectorised in row chunks sized to bound the working set;
+  about six seconds now.
+- The fringe map stacked every frame twice, once for the filtered template and
+  once for the unfiltered one. The high pass is applied after the median in
+  both, so the filtered map follows from the unfiltered one.
+- `gaussian_filter` at sigma 120 is a 961-tap convolution along each axis. The
+  large-scale estimate is now computed on a decimated grid, 50 times faster,
+  differing by under 2 per cent of the fringe amplitude.
+
+**Bugs found and fixed in passing**, all in paths the streaming processor
+bypassed and none introduced by this work:
+
+- `centroid()` counted bad pixels using `results` before `centroid_loop` had
+  assigned it, so the sequential path raised `NameError` on its first frame
+  whenever a bad pixel map existed.
+- `make_bad_pixel_map` subtracted the master bias from the master dark, but
+  `make_master_calibration` already returns the dark bias-subtracted and
+  normalised per second, so the bias frame's structure was folded into the
+  detection thresholds.
+- `medabsdevclip` with `nlimit >= nz - 1` produced an all-NaN master frame that
+  propagated silently to NaN photometry. Now an error naming both numbers.
+- `reduce_science_frames` collected per-frame records that `run.py` discarded.
+
+**Deferred.** `plate_scale` is now read from the instrument config rather than
+hardcoded to SPIRIT's 0.35 in `precision_plots.py`, but it is absent from every
+existing instrument config. Rather than guess a value for cameras whose plate
+scale is not documented, the tool raises and names the missing key. Add
+`plate_scale` to each instrument YAML before using it.
