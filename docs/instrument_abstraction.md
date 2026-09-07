@@ -752,8 +752,12 @@ bypassed and none introduced by this work:
   propagated silently to NaN photometry. Now an error naming both numbers.
 - `reduce_science_frames` collected per-frame records that `run.py` discarded.
 
-**Deferred.** `plate_scale` is now read from the instrument config rather than
-hardcoded to SPIRIT's 0.35 in `precision_plots.py`, but it is absent from every
-existing instrument config. Rather than guess a value for cameras whose plate
-scale is not documented, the tool raises and names the missing key. Add
-`plate_scale` to each instrument YAML before using it.
+**Plate scales.** `plate_scale` is now read from the instrument config rather
+than hardcoded to 0.35 in `precision_plots.py`. It was absent from every existing
+config, and the README's example value of 0.35 turned out to be the Andor
+camera's, not SPIRIT's. Values were added from evidence rather than memory:
+SPIRIT, SPIRIT2 and Callisto all describe the 1280 by 1024 SPIRIT array, whose
+frame headers give 12 µm pixels at an 8.0 m focal length, hence 0.309; Io_ANDOR
+is the 2088 by 2048 Andor iKon-L at the published 0.35; SINISTRO carries
+`PIXSCALE = 0.389` in its headers. A one-character typo in Io_ANDOR.yaml
+(`Io_ANDIR`) was corrected at the same time.

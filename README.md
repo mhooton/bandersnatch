@@ -226,7 +226,7 @@ telescope_diameter: 1.0       # metres
 observatory_altitude: 2440    # metres
 gain: 5.092                   # electrons per ADU
 phpadu: 6.36                  # photons per ADU
-plate_scale: 0.35             # arcsec per pixel (needed by precision_plots.py)
+plate_scale: 0.309            # arcsec per pixel (needed by precision_plots.py)
 saturation_threshold: 11000
 scintillation:
   C_Y: 1.56
@@ -237,6 +237,11 @@ bad_pixel_correction:
   flat_threshold: 0.1
   overwrite_existing: false
 ```
+
+Plate scales in use: 0.309 for the SPIRIT infrared camera (12 µm pixels at the
+1 m telescopes' 8.0 m focal length, both read from the frame headers), 0.35 for
+the Andor iKon-L cameras (13.5 µm pixels, the published SPECULOOS value), 0.389
+for LCO SINISTRO (its `PIXSCALE` keyword) and 0.333 for INT/WFC (`SECPPIX`).
 
 Everything below is inherited by default: a single-extension file, frames typed
 by `IMAGETYP` containing LIGHT/DARK/BIAS/FLAT, `FILTER`, `OBJECT`, `BJD-OBS`
