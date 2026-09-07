@@ -84,7 +84,8 @@ def detect_flatbad_pixels(master_flat, flat_threshold):
     return flatbad_map
 
 
-def make_bad_pixel_map(outdir, run, master_bias, master_dark, master_flat, config):
+def make_bad_pixel_map(outdir, run, master_bias, master_dark, master_flat, config,
+                       instrument=None):
     """
     Create bad pixel map from master calibration frames.
 
@@ -108,11 +109,13 @@ def make_bad_pixel_map(outdir, run, master_bias, master_dark, master_flat, confi
     bad_pixel_map : 2D boolean array
         Combined bad pixel map
     """
-    instrument_name = config['instrument_settings']['inst']
+    instrument_name = (instrument.name if instrument is not None
+                       else config['instrument_settings']['inst'])
     logger.info("Creating bad pixel map for %s", instrument_name)
 
     # Extract configuration
-    inst_config = config['instrument_config']
+    inst_config = (instrument.legacy_config() if instrument is not None
+                   else config['instrument_config'])
     bpm_config = inst_config.get('bad_pixel_correction', None)
 
     if bpm_config is None:
@@ -145,16 +148,24 @@ def make_bad_pixel_map(outdir, run, master_bias, master_dark, master_flat, confi
 
         return bad_pixel_map
 
-    # Subtract bias from dark
-    dark_bias_subtracted = master_dark - master_bias
-
-    # Detect hot and cold pixels
-    logger.info("Detecting hot and cold pixels...")
-    hot_pixel_map, cold_pixel_map = detect_bad_pixels(
-        dark_bias_subtracted,
-        hot_sigma=hot_sigma,
-        cold_sigma=cold_sigma
-    )
+    # The master dark is already bias-subtracted and normalised per second by
+    # make_master_calibration, so it goes straight in. Subtracting the bias a
+    # second time would fold the bias frame's own structure into the threshold
+    # statistics and shift the median away from zero.
+    if master_dark is not None:
+        logger.info("Detecting hot and cold pixels from the master dark...")
+        hot_pixel_map, cold_pixel_map = detect_bad_pixels(
+            master_dark, hot_sigma=hot_sigma, cold_sigma=cold_sigma)
+    elif master_bias is not None:
+        logger.info("No master dark available; looking for outliers in the "
+                    "master bias instead. Hot pixels driven by dark current "
+                    "will not be found this way.")
+        hot_pixel_map, cold_pixel_map = detect_bad_pixels(
+            master_bias, hot_sigma=hot_sigma, cold_sigma=cold_sigma)
+    else:
+        logger.info("Neither dark nor bias available; relying on the flat only")
+        hot_pixel_map = np.zeros(master_flat.shape, dtype=bool)
+        cold_pixel_map = np.zeros(master_flat.shape, dtype=bool)
 
     # Detect flatbad pixels
     logger.info("Detecting flatbad pixels...")
@@ -162,6 +173,15 @@ def make_bad_pixel_map(outdir, run, master_bias, master_dark, master_flat, confi
 
     # Combine all maps
     bad_pixel_map = hot_pixel_map | cold_pixel_map | flatbad_pixel_map
+
+    # Columns the instrument config declares as permanently bad
+    if instrument is not None and instrument.detector.bad_columns:
+        for col in instrument.detector.bad_columns:
+            if 0 <= int(col) < bad_pixel_map.shape[1]:
+                bad_pixel_map[:, int(col)] = True
+        logger.info("Flagged %d configured bad column(s): %s",
+                    len(instrument.detector.bad_columns),
+                    instrument.detector.bad_columns)
 
     # Calculate and log statistics
     total_pixels = bad_pixel_map.size
@@ -206,6 +226,8 @@ def make_bad_pixel_map(outdir, run, master_bias, master_dark, master_flat, confi
     # Save bad pixel map
     hdu = fits.PrimaryHDU(bad_pixel_map.astype(np.uint8))
     hdu.header['INSTRUME'] = instrument_name
+    if instrument is not None:
+        hdu.header['DETECTOR'] = instrument.detector.name
     hdu.header['BPMTYPE'] = 'COMBINED'
     hdu.header['HOTSIGMA'] = (hot_sigma, 'Hot pixel sigma threshold')
     hdu.header['COLDSIGM'] = (cold_sigma, 'Cold pixel sigma threshold')

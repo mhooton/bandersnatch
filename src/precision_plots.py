@@ -309,8 +309,57 @@ def calculate_exposure_time(photometry_dir):
         return 60.0
 
 
+def instrument_properties(instrument, system_name):
+    """Detector and telescope properties for the precision model.
+
+    Values the instrument config declares are used; the rest are the generic
+    estimates this module has always assumed, and are logged as such.
+    """
+    if instrument is None:
+        raise ValueError(
+            "An instrument is required to compute theoretical precision. "
+            "Pass --instrument-name naming a config in the configs directory.")
+
+    plate_scale = instrument.plate_scale
+    if plate_scale is None:
+        raise ValueError(
+            f"{instrument.name}.yaml does not define plate_scale (arcsec per "
+            f"pixel). It is required for the precision model, and a wrong "
+            f"value silently gives a wrong answer, so there is no default.")
+
+    read_noise = instrument.read_noise()
+    if read_noise is None:
+        read_noise = 6.0
+        logger.warning("%s.yaml does not define read_noise; assuming %.1f e-",
+                       instrument.name, read_noise)
+    saturation = instrument.saturation() or 64000
+    diameter = instrument.config.get("telescope_diameter")
+    if diameter is None:
+        diameter = 1.0
+        logger.warning("%s.yaml does not define telescope_diameter; assuming "
+                       "%.1f m", instrument.name, diameter)
+
+    props = {
+        "name": system_name,
+        "plate_scale": plate_scale,
+        "N_dc": 0.2,            # dark current [e/pix/s], generic estimate
+        "N_rn": read_noise,
+        "well_depth": saturation,
+        "well_fill": 0.7,
+        "read_time": 10.0,      # generic estimate
+        "r0": diameter / 2.0,
+        "r1": instrument.config.get("secondary_radius", 0.14 * diameter),
+    }
+    logger.info("Instrument properties: plate_scale=%.3f arcsec/px, "
+                "read_noise=%.1f e-, well_depth=%.0f e-, primary radius=%.2f m",
+                props["plate_scale"], props["N_rn"], props["well_depth"],
+                props["r0"])
+    return props
+
+
 def generate_precision_plot(target_info, teff, distance, target_flux, exp_time,
-                            system_name, config_dir, observed_precision=None):
+                            system_name, config_dir, observed_precision=None,
+                            instrument=None):
     """Generate precision vs brightness plot for a target."""
     try:
         import mphot
@@ -330,18 +379,11 @@ def generate_precision_plot(target_info, teff, distance, target_flux, exp_time,
         "seeing": 1.5  # seeing [arcsec] - typical ground-based
     }
 
-    # Define instrument properties (based on your config)
-    props_instrument = {
-        "name": system_name,
-        "plate_scale": 0.35,  # From your configs
-        "N_dc": 0.2,  # Dark current [e/pix/s] - estimate
-        "N_rn": 6.0,  # Read noise [e_rms/pix] - estimate
-        "well_depth": 64000,  # Well depth [e/pix] - typical
-        "well_fill": 0.7,  # Fractional fill
-        "read_time": 10.0,  # Read time [s] - estimate
-        "r0": 0.5,  # Primary mirror radius [m] - estimate
-        "r1": 0.14,  # Secondary mirror radius [m] - estimate
-    }
+    # Instrument properties come from the instrument config, not from
+    # hardcoded SPIRIT values. plate_scale has no default: a wrong plate scale
+    # silently produces a wrong precision estimate, so a missing one is an
+    # error the caller has to fix in the YAML.
+    props_instrument = instrument_properties(instrument, system_name)
 
     try:
         # Calculate precision for the observed target
@@ -510,7 +552,8 @@ def generate_precision_plot(target_info, teff, distance, target_flux, exp_time,
         return False
 
 
-def process_target(target_info, stellar_catalog, system_name, config_dir):
+def process_target(target_info, stellar_catalog, system_name, config_dir,
+                   instrument=None):
     """Process a single target."""
     target_name = target_info['target_name']
     run_name = target_info['run_name']
@@ -545,7 +588,7 @@ def process_target(target_info, stellar_catalog, system_name, config_dir):
     # Generate precision plot
     success = generate_precision_plot(
         target_info, teff, distance, target_flux, exp_time,
-        system_name, config_dir, observed_precision
+        system_name, config_dir, observed_precision, instrument=instrument
     )
 
     return success
@@ -564,8 +607,9 @@ def main():
                         help='Path to configuration directory (default: topdir/bandersnatch_runs/configs)')
     parser.add_argument('--filter-name', default='zYJ',
                         help='Filter name for system response')
-    parser.add_argument('--instrument-name', default='SPIRIT2',
-                        help='Instrument name for system response')
+    parser.add_argument('--instrument-name', required=True,
+                        help='Instrument name; must match a config in the '
+                             'configs directory')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose logging')
     parser.add_argument('--dry-run', action='store_true',
@@ -654,6 +698,8 @@ def main():
 
     logger.info("Loading system response...")
     try:
+        from instrument import load_instrument
+        instrument = load_instrument(args.instrument_name, config_dir)
         system_name, system_response = load_system_response(
             config_dir, args.filter_name, args.instrument_name
         )
@@ -673,7 +719,8 @@ def main():
         logger.info(f"Processing {i}/{len(all_targets)}: {target_name} ({run_name})")
 
         try:
-            if process_target(target_info, stellar_catalog, system_name, config_dir):
+            if process_target(target_info, stellar_catalog, system_name,
+                              config_dir, instrument=instrument):
                 successful += 1
             else:
                 failed += 1

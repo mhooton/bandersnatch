@@ -1,0 +1,26 @@
+version: '2.2'
+
+services:
+  bandersnatch-pipeline:
+    image: bandersnatch-pipeline:latest
+    container_name: bandersnatch-server
+    user: "886:20"
+    volumes:
+      - /appct/data/speculoos/bandersnatch/src:/opt/bandersnatch/src
+      - /export/data/SPECULOOSPipeline:/data/SPECULOOSPipeline
+    working_dir: /opt/bandersnatch/src
+    environment:
+      - BANDERSNATCH_PATH=/opt/bandersnatch/src
+      - PYTHONPATH=/opt/bandersnatch/src
+      - MPLCONFIGDIR=/tmp/matplotlib-config
+      - FONTCONFIG_CACHEDIR=/tmp/fontconfig-cache
+      - HOME=/tmp
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      nproc: 65536
+      nofile: 65536
+    command: bash
+    stdin_open: true
+    tty: true
+    restart: unless-stopped

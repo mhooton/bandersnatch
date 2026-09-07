@@ -10,55 +10,6 @@ from photometry_analysis import (run_complete_analysis, process_aperture_photome
 # Set up logger for this module
 logger = logging.getLogger(__name__)
 
-def translate_path_for_docker(file_path, outdir):
-    """Translate host paths to Docker container paths when running in Docker."""
-    import os
-    from pathlib import Path
-
-    # Check if running in Docker
-    is_docker = os.environ.get('RUNNING_IN_DOCKER', 'false').lower() == 'true'
-
-    if not is_docker:
-        return file_path  # No translation needed
-
-    # Convert to Path object
-    path = Path(file_path)
-
-    # Extract the relevant parts after bandersnatch_runs
-    # Expected structure: .../bandersnatch_runs/RUN_NAME/TARGET/RUN/filename.fits
-    parts = path.parts
-
-    try:
-        # Find bandersnatch_runs in the path
-        br_idx = None
-        for i, part in enumerate(parts):
-            if part == 'bandersnatch_runs':
-                br_idx = i
-                break
-
-        if br_idx is not None and br_idx + 3 < len(parts):
-            # Parts after bandersnatch_runs: [RUN_NAME, TARGET, RUN, filename]
-            target = parts[br_idx + 2]  # TARGET
-            run = parts[br_idx + 3]  # RUN
-            filename = parts[-1]  # filename
-
-            # Construct Docker path: /app/output/RUN_NAME/TARGET/RUN/filename
-            docker_path = outdir / target / run / filename
-            return str(docker_path)
-    except:
-        pass
-
-    # Fallback: try to extract just target/run/filename from the end
-    if len(parts) >= 3:
-        target = parts[-3]
-        run = parts[-2]
-        filename = parts[-1]
-        docker_path = outdir / target / run / filename
-        return str(docker_path)
-
-    # Final fallback: return original path
-    return file_path
-
 def count_bad_pixels_in_apertures(bad_pixel_map, image_shape, xc, yc, apertures, n_stars):
     """
     Count bad pixels within each aperture for each star.
@@ -164,7 +115,7 @@ def write_photometry_results(photometry_dir, photometry_results, config, target,
     return aperture_tables
 
 def photometry(outdir, run, target, config, aper_min, aper_max, SKYRAD_inner, SKYRAD_outer, sky_suppress,
-               median_filter_window=21, time_bin_size=0.005, bad_pixel_map=None):
+               median_filter_window=21, time_bin_size=0.005, bad_pixel_map=None, exact=False):
     """
     Perform aperture photometry on all processed images for a given target.
 
@@ -194,6 +145,10 @@ def photometry(outdir, run, target, config, aper_min, aper_max, SKYRAD_inner, SK
         Time bin size for diagnostic plots
     bad_pixel_map : np.ndarray or None
         Boolean bad pixel map
+    exact : bool
+        Weight boundary pixels by their exact geometric overlap with the
+        aperture (the IDL APER /EXACT keyword) instead of the default
+        approximate pixel-fraction method
     """
     logger.info("Starting aperture photometry for target %s", target)
 
@@ -236,6 +191,7 @@ def photometry(outdir, run, target, config, aper_min, aper_max, SKYRAD_inner, SK
     logger.info("  Apertures: %s", apr)
     logger.info("  Sky annulus: %s", skyrad)
     logger.info("  Sky suppression: %s", sky_suppress)
+    logger.info("  Exact aperture weighting: %s", exact)
     logger.info("  Median filter window: %d", median_filter_window)
 
     # 3. Create photometry directory
@@ -264,8 +220,7 @@ def photometry(outdir, run, target, config, aper_min, aper_max, SKYRAD_inner, SK
         logger.debug("Processing image %d/%d: %s", i + 1, n_images, file_paths[i])
 
         try:
-            translated_path = translate_path_for_docker(file_paths[i], outdir)
-            with fits.open(translated_path) as hdul:
+            with fits.open(file_paths[i]) as hdul:
                 image = hdul[0].data.astype(np.float64)
 
             xc_frame = xc_data[i, :]
@@ -281,7 +236,8 @@ def photometry(outdir, run, target, config, aper_min, aper_max, SKYRAD_inner, SK
                 skyrad=skyrad,
                 setskyval=setskyval,
                 flux=True,
-                silent=True
+                silent=True,
+                exact=exact
             )
 
             # Count bad pixels in apertures using shared function

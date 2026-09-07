@@ -1,187 +1,110 @@
-import numpy as np
-import os
+"""Apply the reduction chain to a target's science frames and write them out.
+
+This is the sequential path, used when the pipeline is asked for only part of
+the workflow.  When reduction, centroiding and photometry are all requested,
+:mod:`streaming_processor` does the same reduction in one pass without writing
+intermediate images.
+"""
+
 import logging
+import os
+
+import numpy as np
 from astropy.io import fits
-from master_calibrations import overscan_corr
+
 from create_lists import write_liste
 
-from utils import clean_bad_pixels
-
-# Set up logger for this module
 logger = logging.getLogger(__name__)
 
-def apply_calibrations(image, master_bias, master_dark, master_flat, exptime, bad_pixel_map=None):
+
+def annotate_header(header, instrument, record):
+    """Record what was done to a frame, and where it sits on the raw detector.
+
+    ``LTV1``/``LTV2`` are the IRAF convention for a section offset.  DS9 and
+    friends use them to report the original, untrimmed pixel coordinates in
+    their *physical* readout, so a processed frame and a raw frame can be
+    compared position for position.
     """
-    Apply bias, dark, and flat calibrations to a single image.
+    header = header.copy()
+    dx, dy = instrument.detector.trim_offset
+    if dx or dy:
+        header["LTV1"] = (-dx, "Offset to raw detector x")
+        header["LTV2"] = (-dy, "Offset to raw detector y")
+    header["BANDINST"] = (instrument.name, "Instrument config used")
+    header["BANDDET"] = (instrument.detector.name, "Detector processed")
+    header["BANDSTEP"] = (",".join(instrument.steps), "Reduction steps applied")
+    for key, value in (record or {}).items():
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            header[key[:8].upper()] = float(value)
+    return header
 
-    Parameters:
-    -----------
-    image : np.ndarray
-        Raw 2D image array (float64)
-    master_bias : np.ndarray
-        Master bias frame
-    master_dark : np.ndarray
-        Master dark frame (per-second rate)
-    master_flat : np.ndarray
-        Normalised master flat field
-    exptime : float
-        Exposure time in seconds
-    bad_pixel_map : np.ndarray or None
-        Boolean bad pixel map (True = bad). If provided, bad pixels are interpolated.
 
-    Returns:
-    --------
-    np.ndarray : Calibrated image
-    """
-    calibrated = image - master_bias
-    calibrated -= master_dark * exptime
-    calibrated /= master_flat
-
-    if bad_pixel_map is not None:
-        calibrated = clean_bad_pixels(calibrated, bad_pixel_map)
-
-    return calibrated
-
-def reduce_science_frames(outdir, run, target, to_overscan_correct=False, image_extension=0, bad_pixel_map=None):
+def reduce_science_frames(instrument, reducer, outdir, run, target,
+                          target_coord=None):
+    """Reduce every science frame for ``target``; return the per-frame records."""
     logger.info("Starting science frame reduction for target %s", target)
-    logger.debug("Parameters: run=%s, overscan_correct=%s, image_ext=%d",
-                 run, to_overscan_correct, image_extension)
 
-    filenames = []
     list_file = outdir / "calib" / f"{run}_image_{target}.list"
-
     try:
         with open(list_file) as f:
             filenames = [line.strip() for line in f if line.strip()]
         logger.info("Found %d science frames for target %s", len(filenames), target)
-    except Exception as e:
-        logger.error("Failed to read science image list %s: %s", list_file, e)
+    except Exception as exc:
+        logger.error("Failed to read science image list %s: %s", list_file, exc)
         raise
-
     if not filenames:
-        logger.error("No science frames found for target %s", target)
         raise ValueError(f"No science frames found for target {target}")
 
-    # Get filter from first image
-    try:
-        with fits.open(filenames[0]) as hdul:
-            filter = hdul[0].header['FILTER']
-        logger.info("Target %s uses filter: %s", target, filter)
-    except Exception as e:
-        logger.error("Failed to read filter from first science frame %s: %s", filenames[0], e)
-        raise
-
-    # Load master calibration frames
-    bias_file = outdir / 'calib' / f"{run}_master_bias.fits"
-    dark_file = outdir / 'calib' / f"{run}_master_dark.fits"
-    flat_file = outdir / 'calib' / f"{run}_master_flat_{filter}.fits"
-
-    logger.debug("Loading master calibration frames:")
-    logger.debug("  Bias: %s", bias_file)
-    logger.debug("  Dark: %s", dark_file)
-    logger.debug("  Flat: %s", flat_file)
-
-    try:
-        with fits.open(bias_file) as hdul:
-            master_bias = hdul[0].data
-        logger.debug("Loaded master bias: shape %s", master_bias.shape)
-
-        with fits.open(dark_file) as hdul:
-            master_dark = hdul[0].data
-        logger.debug("Loaded master dark: shape %s", master_dark.shape)
-
-        with fits.open(flat_file) as hdul:
-            master_flat = hdul[0].data
-        logger.debug("Loaded master flat: shape %s", master_flat.shape)
-
-    except Exception as e:
-        logger.error("Failed to load master calibration frames: %s", e)
-        raise
-
-    # Create output directories
-    target_dir = outdir / target
-    run_dir = target_dir / run
-
-    os.makedirs(target_dir, exist_ok=True)
+    run_dir = outdir / target / run
     os.makedirs(run_dir, exist_ok=True)
-    logger.debug("Created output directories: %s", run_dir)
+    logger.debug("Created output directory: %s", run_dir)
 
     output_filenames = []
-    successful_reductions = 0
-
-    logger.info("Processing %d science frames for target %s", len(filenames), target)
-
-    for file_loop, filename in enumerate(filenames):
+    records = []
+    for i, filename in enumerate(filenames):
         logger.debug("Processing science frame %d/%d: %s",
-                     file_loop + 1, len(filenames), filename)
-
+                     i + 1, len(filenames), filename)
         try:
-            with fits.open(filename) as hdul:
-                image = hdul[image_extension].data
-                image = image.astype(np.float64)
-                exp_time = hdul[0].header["EXPTIME"]
+            frame = instrument.open_frame(filename)
+            image, record = reducer.reduce(frame)
 
-                # Copy essential headers
-                header = hdul[0].header.copy()
+            output_filename = f"proc{os.path.basename(filename)}"
+            header = annotate_header(frame.meta.header, instrument, record)
+            fits.PrimaryHDU(data=image, header=header).writeto(
+                run_dir / output_filename, overwrite=True)
 
-                logger.debug("Image shape: %s, exposure time: %.2f", image.shape, exp_time)
-
-            # Apply calibrations
-            original_median = np.median(image)
-
-            if to_overscan_correct:
-                logger.debug("Applying overscan correction")
-                image = overscan_corr(image)
-
-            image = apply_calibrations(image, master_bias, master_dark, master_flat,
-                                       exp_time, bad_pixel_map)
-
-            final_median = np.median(image)
-            logger.debug("Reduction complete: median %.1f -> %.1f", original_median, final_median)
-
-            # Create output filename and path
-            output_filename = f"proc{filename.split('/')[-1]}"
-            output_path = run_dir / output_filename
-
-            # Create new FITS file with processed data
-            new_hdu = fits.PrimaryHDU(data=image, header=header)
-            new_hdu.writeto(output_path, overwrite=True)
-
-            logger.debug("Wrote reduced frame: %s", output_path)
             output_filenames.append(output_filename)
-            successful_reductions += 1
-
-        except Exception as e:
-            logger.error("Failed to process science frame %s: %s", filename, e)
-            # Continue processing other frames rather than failing completely
-            logger.warning("Skipping failed frame and continuing with remaining frames")
+            record = dict(record)
+            record.update(file=str(filename), processed=output_filename,
+                          bjd_mid=instrument.compute_bjd(frame.meta, target_coord),
+                          exptime=frame.meta.exptime, airmass=frame.meta.airmass,
+                          altitude=frame.meta.altitude, filter=frame.meta.filter)
+            records.append(record)
+        except Exception as exc:
+            logger.error("Failed to process science frame %s: %s", filename, exc)
+            logger.warning("Skipping failed frame and continuing")
             continue
 
     logger.info("Successfully reduced %d/%d science frames for target %s",
-                successful_reductions, len(filenames), target)
+                len(output_filenames), len(filenames), target)
+    if not output_filenames:
+        raise RuntimeError(
+            f"No science frames were successfully reduced for target {target}")
 
-    if successful_reductions == 0:
-        logger.error("No science frames were successfully reduced for target %s", target)
-        raise RuntimeError(f"No science frames were successfully reduced for target {target}")
+    # The per-frame table is what later stages read instead of reopening raw
+    # files, so the sequential path must write it too.
+    from streaming_processor import write_frames_table
+    write_frames_table(outdir / target, records)
 
-    # Write list of processed files
-    try:
-        write_liste(output_filenames, f"{run}_proc_{target}.list", outdir)
-        logger.info("Created processed frame list: %s_proc_%s.list with %d files",
-                    run, target, len(output_filenames))
-    except Exception as e:
-        logger.error("Failed to write processed frame list: %s", e)
-        raise
-
+    write_liste(output_filenames, f"{run}_proc_{target}.list", outdir)
+    logger.info("Created processed frame list: %s_proc_%s.list with %d files",
+                run, target, len(output_filenames))
     logger.info("Science frame reduction completed for target %s", target)
+    return records
 
 
 if __name__ == "__main__":
-    # Set up basic logging for standalone execution
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     logger.info("Running reduce_science.py as standalone script")
-    # You would call reduce_science_frames() here with appropriate parameters

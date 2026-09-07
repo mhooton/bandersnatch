@@ -1,649 +1,480 @@
-# Read parameters from files
-import numpy as np
-import os
-import logging
-import shutil
-from astropy.io import fits
-from liris import runset_filter
-from utils import medabsdevclip
-from pathlib import Path
-import yaml
-from astropy.table import Table
+"""Build master calibration frames: bias, dark, flat and fringe map.
 
-# Set up logger for this module
+Frames are read through the :class:`~instrument.Instrument`, so multi-extension
+files, overscan and trimming are handled the same way here as in the science
+reduction.  Each product is built from frames reduced exactly as far as the
+step that will consume it: a master flat from frames taken through everything
+before the flat step, a fringe map from frames taken through everything before
+the fringe step.  A product built any other way would not match the frames it
+is applied to.
+"""
+
+import logging
+import os
+import shutil
+from pathlib import Path
+
+import numpy as np
+import yaml
+from astropy.io import fits
+
+from instrument import find_dated_entry
+from reduction import (Reducer, combine_fringe_frames, highpass,
+                       steps_before)
+from utils import medabsdevclip
+
 logger = logging.getLogger(__name__)
 
 
-# Function to perform overscan correction
-def overscan_corr(image, first_column, last_column  # , first_column_2=None, last_column_2=None
-                  ):
-    # This is a placeholder for the overscan correction function
-    # You would need to implement this based on the original IDL function
-    corrected = image.copy()
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
 
-    # Calculate overscan value from the specified columns
-    overscan = np.median(image[:, first_column:last_column + 1])
-    logger.debug("Calculated overscan value: %.2f", overscan)
-
-    # Apply correction
-    corrected -= overscan
-
-    # # If a second overscan region is specified
-    # if first_column_2 is not None and last_column_2 is not None:
-    #     overscan_2 = np.median(image[:, first_column_2:last_column_2 + 1])
-    #     # Apply additional correction if needed
-
-    return corrected
+def read_list(list_file):
+    with open(list_file) as f:
+        return [line.strip() for line in f if line.strip()]
 
 
-def calculate_readout_noise(filenames, image_extension, gain, subtract_overscan=False,
-                            overscan_first_column=None, overscan_last_column=None):
-    """
-    Calculate readout noise from the first two bias frames.
+def _load_if_exists(path):
+    if Path(path).exists():
+        with fits.open(path) as hdul:
+            return hdul[0].data
+    return None
 
-    Parameters:
-    -----------
-    filenames : list
-        List of bias frame filenames
-    image_extension : int
-        FITS extension containing image data
-    gain : float
-        Gain in electrons per ADU
-    subtract_overscan : bool
-        Whether to subtract overscan
-    overscan_first_column : int
-        First column of overscan region
-    overscan_last_column : int
-        Last column of overscan region
 
-    Returns:
-    --------
-    float : Readout noise in electrons
-    """
+def _calib_for_steps(outdir, run, steps, filter=None):
+    """Load whichever master frames a truncated reduction chain needs."""
+    calib = {}
+    caldir = Path(outdir) / "calib"
+    if "bias" in steps:
+        calib["bias"] = _load_if_exists(caldir / f"{run}_master_bias.fits")
+    if "dark" in steps:
+        calib["dark"] = _load_if_exists(caldir / f"{run}_master_dark.fits")
+    if "flat" in steps and filter is not None:
+        calib["flat"] = _load_if_exists(caldir / f"{run}_master_flat_{filter}.fits")
+    return calib
+
+
+def make_reducer_upto(instrument, outdir, run, step, filter=None):
+    """A :class:`~reduction.Reducer` running the chain that precedes ``step``."""
+    steps = steps_before(instrument, step)
+    return Reducer(instrument, _calib_for_steps(outdir, run, steps, filter),
+                   steps=steps)
+
+
+def calculate_readout_noise(instrument, filenames, reducer=None):
+    """Read-out noise in electrons, from the difference of two bias frames."""
     if len(filenames) < 2:
-        logger.warning("Need at least 2 bias frames to calculate readout noise")
+        logger.warning("Need at least 2 bias frames for readout noise")
         return 0.0
-
     try:
-        # Read first two bias frames
-        with fits.open(filenames[0]) as hdul:
-            bias1 = hdul[image_extension].data.astype(np.float64)
-
-        with fits.open(filenames[1]) as hdul:
-            bias2 = hdul[image_extension].data.astype(np.float64)
-
-        # Apply overscan correction if requested
-        if subtract_overscan:
-            bias1 = overscan_corr(bias1, overscan_first_column, overscan_last_column)
-            bias2 = overscan_corr(bias2, overscan_first_column, overscan_last_column)
-
-        # Calculate difference and standard deviation
-        diff = bias1 - bias2
+        frames = []
+        for name in filenames[:2]:
+            frame = instrument.open_frame(name)
+            data = (reducer.reduce(frame)[0] if reducer is not None
+                    else instrument.trim(frame.data))
+            frames.append(np.asarray(data, dtype=np.float64))
+        diff = frames[0] - frames[1]
         adu_diff = np.std(diff)
-
-        # Convert to electrons using gain and sqrt(2) factor
-        # (sqrt(2) factor accounts for difference of two independent measurements)
-        ron = adu_diff * gain / np.sqrt(2)
-
-        logger.info("Calculated readout noise: %.2f electrons (%.2f ADU)", ron, adu_diff)
-        return ron
-
-    except Exception as e:
-        logger.error("Failed to calculate readout noise: %s", e)
+        ron = adu_diff * instrument.gain() / np.sqrt(2)
+        logger.info("Calculated readout noise: %.3f electrons", ron)
+        return float(ron)
+    except Exception as exc:
+        logger.error("Failed to calculate readout noise: %s", exc)
         return 0.0
 
 
-def process_flat_session(filenames, run, outdir, filter, instrument, runset_cut, image_extension,
-                         subtract_overscan, overscan_first_column, overscan_last_column,
+def copy_backup_calibration(backup_path, output_file, calib_type, filter=None):
+    """Copy a pre-made calibration into this run's calib directory."""
+    if not os.path.exists(backup_path):
+        filter_str = f" for filter {filter}" if filter else ""
+        logger.error("Backup %s file not found: %s%s",
+                     calib_type, backup_path, filter_str)
+        raise FileNotFoundError(
+            f"Backup {calib_type} file not found: {backup_path}")
+    os.makedirs(Path(output_file).parent, exist_ok=True)
+    shutil.copy2(backup_path, output_file)
+    logger.info("Copied backup %s to %s", calib_type, output_file)
+
+
+# --------------------------------------------------------------------------
+# dated backup configuration
+# --------------------------------------------------------------------------
+
+def _load_yaml(config_dir, name):
+    path = Path(config_dir) / name
+    try:
+        with open(path, "r") as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        logger.debug("Optional config not found: %s", path)
+        return None
+    except yaml.YAMLError as exc:
+        logger.error("Error parsing %s: %s", path, exc)
+        return None
+
+
+def load_master_flats_config(config_dir):
+    return _load_yaml(config_dir, "master_flats.yaml")
+
+
+def load_fringe_maps_config(config_dir):
+    return _load_yaml(config_dir, "fringe_maps.yaml")
+
+
+def find_backup_flat_for_date(master_flats_config, filter_name, observation_date):
+    entry = find_dated_entry(master_flats_config, [filter_name],
+                             observation_date, root="filters")
+    return entry["path"] if entry else None
+
+
+def find_backup_fringe_map(fringe_maps_config, filter_name, detector_name,
+                           observation_date):
+    entry = find_dated_entry(fringe_maps_config, [filter_name, detector_name],
+                            observation_date, root="maps")
+    return entry["path"] if entry else None
+
+
+# --------------------------------------------------------------------------
+# fringe map
+# --------------------------------------------------------------------------
+
+FRINGE_PROVENANCE = ("INSTRUME", "DETECTOR", "FILTER")
+
+
+def write_fringe_map(path, template, raw_template, instrument, filter_name,
+                     n_frames):
+    """Write a fringe map with the provenance needed to verify it on load."""
+    hdu = fits.PrimaryHDU(np.asarray(template, dtype=np.float32))
+    hdu.header["INSTRUME"] = instrument.name
+    hdu.header["DETECTOR"] = instrument.detector.name
+    hdu.header["FILTER"] = filter_name
+    hdu.header["NFRAMES"] = (n_frames, "Dithered frames combined")
+    if instrument.detector.trim:
+        hdu.header["TRIMSEC"] = instrument.detector.trim
+    hdu.header["HPSIGMA"] = (instrument.fringe.highpass_sigma,
+                             "Large-scale removal sigma (px)")
+    extra = fits.ImageHDU(np.asarray(raw_template, dtype=np.float32),
+                          name="UNFILTERED")
+    fits.HDUList([hdu, extra]).writeto(path, overwrite=True)
+    logger.info("Fringe map written to %s (%d frames)", path, n_frames)
+
+
+def load_fringe_map(path, instrument, filter_name, expected_shape=None):
+    """Load a fringe map, refusing one built for a different configuration.
+
+    A map from the wrong detector or filter would produce a plausible-looking
+    but wrong correction, so a mismatch is an error rather than a warning.
+    """
+    with fits.open(path) as hdul:
+        data = np.asarray(hdul[0].data, dtype=np.float64)
+        header = hdul[0].header
+
+    expected = {"INSTRUME": instrument.name,
+                "DETECTOR": instrument.detector.name,
+                "FILTER": filter_name}
+    for key, want in expected.items():
+        have = header.get(key)
+        if have is None:
+            logger.warning("Fringe map %s has no %s keyword; cannot verify "
+                           "provenance", path, key)
+            continue
+        if str(have).strip() != str(want).strip():
+            raise ValueError(
+                f"Fringe map {path} was built for {key}={have!r} but this run "
+                f"needs {want!r}. Applying it would give a wrong correction.")
+    if expected_shape is not None and data.shape != tuple(expected_shape):
+        raise ValueError(
+            f"Fringe map {path} has shape {data.shape}, but this detector's "
+            f"trimmed frames are {tuple(expected_shape)}")
+    return data
+
+
+def make_fringe_map(instrument, outdir, run, config, filter, config_dir=None):
+    """Build, or fetch, the fringe map for one filter."""
+    caldir = Path(outdir) / "calib"
+    os.makedirs(caldir, exist_ok=True)
+    output_file = caldir / f"{run}_fringe_map_{filter}.fits"
+    calib_params = config.get("calibration_params", {}) or {}
+    observation_date = config["instrument_settings"]["date"]
+    config_dir = Path(config_dir or config.get("_config_dir", "."))
+
+    def from_config():
+        maps_cfg = load_fringe_maps_config(config_dir)
+        path = find_backup_fringe_map(maps_cfg, filter,
+                                      instrument.detector.name, observation_date)
+        if path:
+            copy_backup_calibration(path, output_file, "fringe map", filter)
+            return True
+        direct = (calib_params.get("backup_fringe_maps") or {}).get(filter)
+        if direct:
+            copy_backup_calibration(direct, output_file, "fringe map", filter)
+            return True
+        return False
+
+    if calib_params.get("force_backup_fringe_map", False):
+        logger.info("force_backup_fringe_map set; taking the map from config")
+        if from_config():
+            return
+        logger.warning("No configured fringe map found; building from this night")
+
+    list_file = caldir / f"{run}_fringe_{filter}.list"
+    if not list_file.exists():
+        logger.warning("No fringe frame list for filter %s: %s", filter, list_file)
+        if from_config():
+            return
+        raise FileNotFoundError(
+            f"No fringe frames for filter {filter} on {observation_date}, and no "
+            f"entry in fringe_maps.yaml for detector "
+            f"{instrument.detector.name}, nor a backup_fringe_maps path. "
+            f"The reduction recipe includes a 'fringe' step, so a map is required.")
+
+    filenames = read_list(list_file)
+    logger.info("Building fringe map for filter %s from %d dithered frames",
+                filter, len(filenames))
+    reducer = make_reducer_upto(instrument, outdir, run, "fringe", filter)
+
+    images = []
+    for name in filenames:
+        try:
+            image, _ = reducer.reduce(instrument.open_frame(name))
+            images.append(image)
+        except Exception as exc:
+            logger.error("Failed to reduce fringe frame %s: %s", name, exc)
+    if len(images) < 3:
+        raise ValueError(
+            f"Only {len(images)} usable fringe frames for filter {filter}; "
+            "a median combine needs several dithered frames to reject stars")
+
+    n_frames = len(images)
+    raw_template = combine_fringe_frames(images)
+    del images                      # free the stack before filtering
+    # The high pass is applied after the median in both cases, so the filtered
+    # template follows from the unfiltered one; combining twice would double
+    # peak memory for no gain.
+    template = highpass(raw_template, instrument.fringe.highpass_sigma)
+    write_fringe_map(output_file, template, raw_template, instrument, filter,
+                     n_frames)
+
+
+# --------------------------------------------------------------------------
+# master bias, dark, flat
+# --------------------------------------------------------------------------
+
+def process_flat_session(instrument, filenames, run, outdir, filter,
                          clip, nlimit, session_name):
-    """Process a single flat field session (dawn or dusk)"""
+    """Combine one flat session (dusk, dawn or dome) into a normalised master."""
     logger.info("Processing %s session for filter %s", session_name, filter)
-
-    # Filter LIRIS data if needed
-    if instrument == 'LIRIS':
-        original_count = len(filenames)
-        filenames = runset_filter(filenames, runset_cut)
-        if len(filenames) != original_count:
-            logger.info("LIRIS runset filter: %d -> %d files", original_count, len(filenames))
-
     if not filenames:
         logger.warning("No files found for %s session", session_name)
         return None
 
     n_files = len(filenames)
     logger.info("Processing %s session with %d files", session_name, n_files)
+    reducer = make_reducer_upto(instrument, outdir, run, "flat", filter)
 
-    # Read in single fits image to find its dimensions
-    try:
-        with fits.open(filenames[0]) as hdul:
-            image = hdul[image_extension].data
-
-        nx = image.shape[1]  # Number of columns
-        ny = image.shape[0]  # Number of rows
-        logger.debug("Image dimensions: %d x %d pixels", nx, ny)
-
-        # Define data_cube and its dimensions
-        data_cube = np.zeros((ny, nx, n_files))
-        logger.debug("Created data cube: %d x %d x %d", ny, nx, n_files)
-
-    except Exception as e:
-        logger.error("Failed to read first flat file %s: %s", filenames[0], e)
-        raise
-
-    # Process all flats in this session
+    data_cube = None
     for file_loop, filename in enumerate(filenames):
-        logger.debug("Reading %s flat %d/%d: %s", session_name, file_loop + 1, len(filenames), filename)
-
+        logger.debug("Reading %s flat %d/%d: %s",
+                     session_name, file_loop + 1, n_files, filename)
         try:
-            with fits.open(filename) as hdul:
-                image = hdul[image_extension].data
-                exp_time = hdul[0].header["EXPTIME"]
-
-            if subtract_overscan:
-                logger.debug("Applying overscan correction to %s", filename)
-                image = overscan_corr(
-                    image,
-                    overscan_first_column,
-                    overscan_last_column,
-                )
-
-            # Apply bias and dark corrections
-            image = image.astype(np.float64)
-
-            bias_file = outdir / 'calib' / f"{run}_master_bias.fits"
-            dark_file = outdir / 'calib' / f"{run}_master_dark.fits"
-
-            try:
-                with fits.open(bias_file) as hdul:
-                    master_bias = hdul[0].data
-                image -= master_bias
-                logger.debug("Applied bias correction")
-
-                with fits.open(dark_file) as hdul:
-                    master_dark = hdul[0].data
-                image -= master_dark * exp_time
-                logger.debug("Applied dark correction (exp_time=%.2f)", exp_time)
-
-            except Exception as e:
-                logger.error("Failed to apply calibrations to %s: %s", filename, e)
-                raise
-
-            data_cube[:, :, file_loop] = image
-
-        except Exception as e:
-            logger.error("Failed to process flat file %s: %s", filename, e)
+            image, _ = reducer.reduce(instrument.open_frame(filename))
+        except Exception as exc:
+            logger.error("Failed to process flat file %s: %s", filename, exc)
             raise
+        if data_cube is None:
+            ny, nx = image.shape
+            logger.debug("Image dimensions: %d x %d pixels", nx, ny)
+            data_cube = np.zeros((ny, nx, n_files))
+        data_cube[:, :, file_loop] = image
 
-    # Create session master flat
-    logger.debug("Creating %s session master flat with clip=%.1f, nlimit=%d", session_name, clip, nlimit)
+    logger.debug("Creating %s session master flat with clip=%.1f, nlimit=%d",
+                 session_name, clip, nlimit)
     session_master = medabsdevclip(data_cube, clip, nlimit)
     session_master /= np.median(session_master)
-
-    logger.info("%s session master flat created successfully", session_name.capitalize())
+    logger.info("%s session master flat created successfully",
+                session_name.capitalize())
     return session_master
 
 
-def copy_backup_calibration(backup_path, output_file, calib_type, filter=None):
-    """Copy a backup calibration file to the expected output location"""
-    if not os.path.exists(backup_path):
-        filter_str = f" for filter {filter}" if filter else ""
-        logger.error("Backup %s file not found: %s%s", calib_type, backup_path, filter_str)
-        raise FileNotFoundError(f"Backup {calib_type} file not found: {backup_path}")
+def _make_master_flat(instrument, outdir, run, config, filter, clip, nlimit,
+                      config_dir):
+    caldir = Path(outdir) / "calib"
+    output_file = caldir / f"{run}_master_flat_{filter}.fits"
+    calib_params = config.get("calibration_params", {}) or {}
+    observation_date = config["instrument_settings"]["date"]
 
-    try:
-        # Ensure output directory exists
-        os.makedirs(output_file.parent, exist_ok=True)
+    def from_config():
+        flats_cfg = load_master_flats_config(config_dir)
+        path = find_backup_flat_for_date(flats_cfg, filter, observation_date)
+        if path:
+            copy_backup_calibration(path, output_file, "flat", filter)
+            return True
+        direct = (calib_params.get("backup_master_flats") or {}).get(filter)
+        if direct:
+            copy_backup_calibration(direct, output_file, "flat", filter)
+            return True
+        return False
 
-        # Copy the backup file
-        shutil.copy2(backup_path, output_file)
+    if calib_params.get("force_backup_flats", False):
+        logger.info("Forced backup flats enabled for filter %s", filter)
+        if from_config():
+            return None
+        logger.warning("No suitable backup flat found, falling back to creation")
 
-        filter_str = f" for filter {filter}" if filter else ""
-        logger.info("Using backup %s%s: copied %s -> %s", calib_type, filter_str, backup_path, output_file)
+    sessions = {}
+    for name in ("dusk", "dawn", "dome"):
+        path = caldir / f"{run}_flat_{filter}_{name}.list"
+        if path.exists():
+            sessions[name] = read_list(path)
+            logger.info("Found %d %s flat files", len(sessions[name]), name)
 
-    except Exception as e:
-        logger.error("Failed to copy backup %s file: %s", calib_type, e)
-        raise
+    combined_list = caldir / f"{run}_flat_{filter}.list"
+    combined = read_list(combined_list) if combined_list.exists() else []
+    if not sessions and combined:
+        logger.warning("Using combined flat list %s", combined_list)
+        logger.warning("Consider separate sessions for better star rejection")
 
+    if not sessions and not combined:
+        logger.warning("No flat field lists found for filter %s", filter)
+        if from_config():
+            return None
+        raise ValueError(
+            f"No flat field files or backup found for filter {filter}")
 
-def load_master_flats_config(config_dir):
-    """Load master flats configuration file."""
-    master_flats_config_path = config_dir / "master_flats.yaml"
-    try:
-        with open(master_flats_config_path, 'r') as f:
-            master_flats_config = yaml.safe_load(f)
-        return master_flats_config
-    except FileNotFoundError:
-        logger.debug("Master flats config file not found: %s", master_flats_config_path)
-        return None
-    except yaml.YAMLError as e:
-        logger.error("Error parsing master flats YAML config file: %s", e)
-        return None
-
-
-def find_backup_flat_for_date(master_flats_config, filter_name, observation_date):
-    """
-    Find the appropriate backup flat for a given filter and observation date.
-
-    Parameters:
-    -----------
-    master_flats_config : dict
-        Master flats configuration dictionary
-    filter_name : str
-        Filter name (e.g., 'zYJ')
-    observation_date : str
-        Observation date in YYYYMMDD format
-
-    Returns:
-    --------
-    str or None : Path to backup flat file, or None if not found
-    """
-    if not master_flats_config or 'filters' not in master_flats_config:
-        return None
-
-    if filter_name not in master_flats_config['filters']:
-        logger.debug("Filter %s not found in master flats config", filter_name)
-        return None
-
-    filter_config = master_flats_config['filters'][filter_name]
-
-    # Find the most recent start_date that is <= observation_date
-    best_match = None
-    best_start_date = None
-
-    for entry in filter_config:
-        start_date = entry['start_date']
-        if start_date <= observation_date:
-            if best_start_date is None or start_date > best_start_date:
-                best_match = entry
-                best_start_date = start_date
-
-    if best_match:
-        logger.info("Found backup flat for filter %s (date %s): using config from %s",
-                    filter_name, observation_date, best_start_date)
-        return best_match['path']
-    else:
-        logger.debug("No suitable backup flat found for filter %s on date %s",
-                     filter_name, observation_date)
-        return None
-
-def make_master_calibration(type, outdir, run, instrument, config, filter="zYJ", subtract_overscan=False,
-                            runset_cut=None,
-                            image_extension=0, overscan_first_column=None, overscan_last_column=None,
-                            overscan_first_column2=None, overscan_last_column2=None, clip=5, nlimit=5):
-    logger.info("Creating master %s calibration", type)
-    logger.debug("Parameters: filter=%s, clip=%.1f, nlimit=%d, image_ext=%d",
-                 filter, clip, nlimit, image_extension)
-
-    # Ensure output directory exists
-    calib_dir = outdir / 'calib'
-    os.makedirs(calib_dir, exist_ok=True)
-    logger.debug("Created calibration directory: %s", calib_dir)
-
-    # Check for forced backup flats (only for flat type)
-    if type == "flat":
-        force_backup_flats = config.get('calibration_params', {}).get('force_backup_flats', False)
-
-        if force_backup_flats:
-            logger.info("Forced backup flats enabled, checking master flats configuration")
-
-            # Load master flats config
-            config_dir = Path(config.get('_config_dir', '.'))  # This will be set by run.py
-            master_flats_config = load_master_flats_config(config_dir)
-
-            if master_flats_config:
-                observation_date = config['instrument_settings']['date']
-                backup_flat_path = find_backup_flat_for_date(master_flats_config, filter, observation_date)
-
-                if backup_flat_path:
-                    suffix = f"_{filter}"
-                    output_file = calib_dir / f"{run}_master_{type + suffix}.fits"
-
-                    logger.info("Using forced backup flat for filter %s from date-based config", filter)
-                    copy_backup_calibration(backup_flat_path, output_file, "flat", filter)
-                    return
-                else:
-                    logger.warning(
-                        "No suitable backup flat found in master flats config, falling back to normal creation")
-            else:
-                logger.warning("Could not load master flats config, falling back to normal creation")
-
-    filenames = []
-
-    if type == "flat":
-        suffix = f"_{filter}"
-        output_file = calib_dir / f"{run}_master_{type + suffix}.fits"
-        logger.info("Processing flat field for filter %s", filter)
-
-        # Handle dawn/dusk flat processing
-        dawn_file = outdir / "calib" / f"{run}_flat_{filter}_dawn.list"
-        dusk_file = outdir / "calib" / f"{run}_flat_{filter}_dusk.list"
-        old_style_file = outdir / "calib" / f"{run}_flat_{filter}.list"
-
-        dawn_filenames = []
-        dusk_filenames = []
-
-        # Check for new style dawn/dusk files
-        if dawn_file.exists():
-            logger.debug("Found dawn flat list: %s", dawn_file)
-            with open(dawn_file) as f:
-                dawn_filenames = [line.strip() for line in f if line.strip()]
-            logger.info("Found %d dawn flat files", len(dawn_filenames))
-
-        if dusk_file.exists():
-            logger.debug("Found dusk flat list: %s", dusk_file)
-            with open(dusk_file) as f:
-                dusk_filenames = [line.strip() for line in f if line.strip()]
-            logger.info("Found %d dusk flat files", len(dusk_filenames))
-
-        # Fallback to old style single file
-        if not dawn_filenames and not dusk_filenames and old_style_file.exists():
-            logger.warning("Using old-style flat list %s", old_style_file)
-            logger.warning("Consider splitting into dawn/dusk files for better star rejection")
-            with open(old_style_file) as f:
-                filenames = [line.strip() for line in f if line.strip()]
-            logger.info("Found %d flat files in old-style list", len(filenames))
-
-        # Check if we have any flat files
-        has_flat_files = bool(dawn_filenames or dusk_filenames or filenames)
-
-        if not has_flat_files:
-            # No flat lists found, try to use master flats config first
-            logger.warning("No flat field lists found for filter %s", filter)
-
-            # Try master flats config first
-            config_dir = Path(config.get('_config_dir', '.'))
-            master_flats_config = load_master_flats_config(config_dir)
-
-            if master_flats_config:
-                observation_date = config['instrument_settings']['date']
-                backup_flat_path = find_backup_flat_for_date(master_flats_config, filter, observation_date)
-
-                if backup_flat_path:
-                    logger.info("Using backup flat for filter %s from master flats config", filter)
-                    copy_backup_calibration(backup_flat_path, output_file, "flat", filter)
-                    return
-
-            # Fallback to old backup system if master flats config doesn't work
-            backup_flats = config.get('calibration_params', {}).get('backup_master_flats', {})
-            if filter in backup_flats:
-                backup_path = backup_flats[filter]
-                logger.info("Using legacy backup master flat for filter %s", filter)
-                copy_backup_calibration(backup_path, output_file, "flat", filter)
-                return
-            else:
-                logger.error("No backup master flat found for filter %s", filter)
-                raise ValueError(f"No flat field files or backup found for filter {filter}")
-
-        if dawn_filenames or dusk_filenames:
-            # Process dawn/dusk sessions separately
-            session_masters = []
-
-            if dawn_filenames:
-                dawn_master = process_flat_session(
-                    dawn_filenames, run, outdir, filter, instrument, runset_cut,
-                    image_extension, subtract_overscan, overscan_first_column,
-                    overscan_last_column, clip, nlimit, "dawn"
-                )
-                if dawn_master is not None:
-                    session_masters.append(dawn_master)
-
-            if dusk_filenames:
-                dusk_master = process_flat_session(
-                    dusk_filenames, run, outdir, filter, instrument, runset_cut,
-                    image_extension, subtract_overscan, overscan_first_column,
-                    overscan_last_column, clip, nlimit, "dusk"
-                )
-                if dusk_master is not None:
-                    session_masters.append(dusk_master)
-
-            if not session_masters:
-                logger.error("No valid flat sessions found for filter %s", filter)
-                raise ValueError(f"No valid flat sessions found for filter {filter}")
-
-            # Combine session masters
-            if len(session_masters) == 1:
-                logger.info("Only one session available, using that as master flat")
-                master_frame = session_masters[0]
-            else:
-                logger.info("Combining %d session masters", len(session_masters))
-                combined_cube = np.stack(session_masters, axis=2)
-                master_frame = np.median(combined_cube, axis=2)
-                master_frame /= np.median(master_frame)
-
-            logger.info("Final master flat created from %d session(s)", len(session_masters))
-
-        elif filenames:
-            # Process old-style single list (original behavior)
-            logger.info("Processing %d flat files using old-style method", len(filenames))
-
-            # Filter LIRIS data if needed
-            if instrument == 'LIRIS':
-                original_count = len(filenames)
-                filenames = runset_filter(filenames, runset_cut)
-                if len(filenames) != original_count:
-                    logger.info("LIRIS runset filter: %d -> %d files", original_count, len(filenames))
-
-            n_files = len(filenames)
-
-            # Read in single fits image to find its dimensions
-            try:
-                with fits.open(filenames[0]) as hdul:
-                    image = hdul[image_extension].data
-
-                nx = image.shape[1]  # Number of columns
-                ny = image.shape[0]  # Number of rows
-                logger.debug("Image dimensions: %d x %d pixels", nx, ny)
-
-                # Define data_cube and its dimensions
-                data_cube = np.zeros((ny, nx, n_files))
-                logger.debug("Created data cube: %d x %d x %d", ny, nx, n_files)
-
-            except Exception as e:
-                logger.error("Failed to read first flat file %s: %s", filenames[0], e)
-                raise
-
-            # Process all flats
-            logger.info("Populating data cube with %d flat files", n_files)
-            for file_loop, filename in enumerate(filenames):
-                logger.debug("Reading flat %d/%d: %s", file_loop + 1, len(filenames), filename)
-
-                try:
-                    with fits.open(filename) as hdul:
-                        image = hdul[image_extension].data
-                        exp_time = hdul[0].header["EXPTIME"]
-
-                    if subtract_overscan:
-                        logger.debug("Applying overscan correction")
-                        image = overscan_corr(
-                            image,
-                            overscan_first_column,
-                            overscan_last_column,
-                        )
-
-                    image = image.astype(np.float64)
-
-                    bias_file = outdir / 'calib' / f"{run}_master_bias.fits"
-                    dark_file = outdir / 'calib' / f"{run}_master_dark.fits"
-
-                    with fits.open(bias_file) as hdul:
-                        master_bias = hdul[0].data
-                    image -= master_bias
-
-                    with fits.open(dark_file) as hdul:
-                        master_dark = hdul[0].data
-                    image -= master_dark * exp_time
-
-                    data_cube[:, :, file_loop] = image
-
-                except Exception as e:
-                    logger.error("Failed to process flat file %s: %s", filename, e)
-                    raise
-
-            # Create master flat
-            logger.debug("Creating master flat with clip=%.1f, nlimit=%d", clip, nlimit)
-            master_frame = medabsdevclip(data_cube, clip, nlimit)
+    if sessions:
+        masters = []
+        for name, files in sessions.items():
+            master = process_flat_session(instrument, files, run, outdir, filter,
+                                          clip, nlimit, name)
+            if master is not None:
+                masters.append(master)
+        if not masters:
+            raise ValueError(f"No valid flat sessions found for filter {filter}")
+        if len(masters) == 1:
+            logger.info("Only one session available, using that as master flat")
+            master_frame = masters[0]
+        else:
+            logger.info("Combining %d session masters", len(masters))
+            master_frame = np.median(np.stack(masters, axis=2), axis=2)
             master_frame /= np.median(master_frame)
-
+        logger.info("Final master flat created from %d session(s)", len(masters))
     else:
-        # Handle bias and dark calibrations
-        suffix = ""
-        output_file = calib_dir / f"{run}_master_{type + suffix}.fits"
-        list_file = outdir / "calib" / f"{run}_{type + suffix}.list"
+        logger.info("Processing %d flat files from a combined list", len(combined))
+        master_frame = process_flat_session(
+            instrument, combined, run, outdir, filter, clip, nlimit, "combined")
+    return master_frame
 
-        logger.info("Processing %s calibration from %s", type, list_file)
 
-        # Check if list file exists
-        if not list_file.exists():
-            logger.warning("No %s list file found: %s", type, list_file)
+def _make_master_bias_or_dark(instrument, outdir, run, config, type, clip,
+                              nlimit):
+    caldir = Path(outdir) / "calib"
+    output_file = caldir / f"{run}_master_{type}.fits"
+    list_file = caldir / f"{run}_{type}.list"
+    logger.info("Processing %s calibration from %s", type, list_file)
 
-            # Try to use backup
-            backup_key = f"backup_master_{type}"
-            backup_path = config.get('calibration_params', {}).get(backup_key)
+    if not list_file.exists():
+        logger.warning("No %s list file found: %s", type, list_file)
+        backup_path = (config.get("calibration_params", {}) or {}).get(
+            f"backup_master_{type}")
+        if backup_path:
+            logger.info("Attempting to use backup master %s", type)
+            copy_backup_calibration(backup_path, output_file, type)
+            return None
+        raise FileNotFoundError(
+            f"No {type} list file found and no backup specified: {list_file}")
 
-            if backup_path:
-                logger.info("Attempting to use backup master %s", type)
-                copy_backup_calibration(backup_path, output_file, type)
-                return
-            else:
-                logger.error("No backup master %s specified in config", type)
-                raise FileNotFoundError(f"No {type} list file found and no backup specified: {list_file}")
+    filenames = read_list(list_file)
+    logger.info("Found %d %s files", len(filenames), type)
+    if not filenames:
+        raise ValueError(f"{type} list {list_file} is empty")
 
+    reducer = make_reducer_upto(instrument, outdir, run, type)
+
+    if type == "bias" and len(filenames) >= 2:
+        logger.info("Calculating readout noise from bias frames...")
+        ron = calculate_readout_noise(instrument, filenames, reducer)
         try:
-            with open(list_file) as f:
-                filenames = [line.strip() for line in f if line.strip()]
-            logger.info("Found %d %s files", len(filenames), type)
-        except Exception as e:
-            logger.error("Failed to read %s list file %s: %s", type, list_file, e)
+            with open(caldir / "readoutnoise.txt", "w") as f:
+                f.write(f"{ron:.3f}\n")
+            logger.info("Saved readout noise to: %s", caldir / "readoutnoise.txt")
+        except Exception as exc:
+            logger.error("Failed to save readout noise file: %s", exc)
+
+    data_cube = None
+    for file_loop, filename in enumerate(filenames):
+        logger.debug("Reading %s %d/%d: %s",
+                     type, file_loop + 1, len(filenames), filename)
+        try:
+            frame = instrument.open_frame(filename)
+            image, _ = reducer.reduce(frame)
+            if type == "dark":
+                image = image / frame.meta.exptime
+                logger.debug("Normalised dark by exposure time: %.2f",
+                             frame.meta.exptime)
+        except Exception as exc:
+            logger.error("Failed to process %s file %s: %s", type, filename, exc)
             raise
-
-        # Calculate readout noise for bias frames
-        if type == "bias" and len(filenames) >= 2:
-            logger.info("Calculating readout noise from bias frames...")
-            gain = config['instrument_config']['gain']
-
-            ron = calculate_readout_noise(
-                filenames, image_extension, gain, subtract_overscan,
-                overscan_first_column, overscan_last_column
-            )
-
-            # Save readout noise to file
-            ron_file = calib_dir / "readoutnoise.txt"
-            try:
-                with open(ron_file, 'w') as f:
-                    f.write(f'{ron:.3f}\n')
-                logger.info("Saved readout noise to: %s", ron_file)
-            except Exception as e:
-                logger.error("Failed to save readout noise file: %s", e)
-
-        # Filter LIRIS data if needed
-        if instrument == 'LIRIS':
-            original_count = len(filenames)
-            filenames = runset_filter(filenames, runset_cut)
-            if len(filenames) != original_count:
-                logger.info("LIRIS runset filter: %d -> %d files", original_count, len(filenames))
-
-        n_files = len(filenames)
-
-        # Read in single fits image to find its dimensions
-        try:
-            with fits.open(filenames[0]) as hdul:
-                image = hdul[image_extension].data
-
-            nx = image.shape[1]  # Number of columns
-            ny = image.shape[0]  # Number of rows
+        if data_cube is None:
+            ny, nx = image.shape
             logger.debug("Image dimensions: %d x %d pixels", nx, ny)
+            data_cube = np.zeros((ny, nx, len(filenames)))
+        data_cube[:, :, file_loop] = image
 
-            # Define data_cube and its dimensions
-            data_cube = np.zeros((ny, nx, n_files))
-            logger.debug("Created data cube: %d x %d x %d", ny, nx, n_files)
+    logger.debug("Creating master %s with clip=%.1f, nlimit=%d", type, clip, nlimit)
+    master_frame = medabsdevclip(data_cube, clip, nlimit)
 
-        except Exception as e:
-            logger.error("Failed to read first %s file %s: %s", type, filenames[0], e)
-            raise
+    if type == "dark":
+        dark_current = instrument.gain() * np.median(master_frame)
+        logger.info("Calculated dark current: %.3f electrons/sec/pixel", dark_current)
+        try:
+            with open(caldir / "darkcurrent.txt", "w") as f:
+                f.write(f"{dark_current:.3f}\n")
+        except Exception as exc:
+            logger.error("Failed to save dark current file: %s", exc)
+    return master_frame
 
-        # FEED IN ALL BIASES/DARKS TO DATA CUBE
-        logger.info("Populating data cube with %d %s files", n_files, type)
-        for file_loop, filename in enumerate(filenames):
-            logger.debug("Reading %s %d/%d: %s", type, file_loop + 1, len(filenames), filename)
 
-            try:
-                with fits.open(filename) as hdul:
-                    image = hdul[image_extension].data
-                    exp_time = hdul[0].header["EXPTIME"]
+def make_master_calibration(type, outdir, run, instrument, config,
+                            filter="zYJ", clip=5, nlimit=5, config_dir=None):
+    """Build one master calibration frame and write it to ``{outdir}/calib``."""
+    logger.info("Creating master %s calibration", type)
+    caldir = Path(outdir) / "calib"
+    os.makedirs(caldir, exist_ok=True)
+    config_dir = Path(config_dir or config.get("_config_dir", "."))
 
-                if subtract_overscan:
-                    logger.debug("Applying overscan correction")
-                    image = overscan_corr(
-                        image,
-                        overscan_first_column,
-                        overscan_last_column,
-                    )
+    if type == "fringe":
+        return make_fringe_map(instrument, outdir, run, config, filter, config_dir)
 
-                if type in ["dark"]:
-                    image = image.astype(np.float64)
-                    bias_file = outdir / 'calib' / f"{run}_master_bias.fits"
+    if type == "flat":
+        output_file = caldir / f"{run}_master_flat_{filter}.fits"
+        master_frame = _make_master_flat(instrument, outdir, run, config, filter,
+                                         clip, nlimit, config_dir)
+    elif type in ("bias", "dark"):
+        output_file = caldir / f"{run}_master_{type}.fits"
+        master_frame = _make_master_bias_or_dark(instrument, outdir, run, config,
+                                                 type, clip, nlimit)
+    else:
+        raise ValueError(f"Unknown calibration type {type!r}")
 
-                    with fits.open(bias_file) as hdul:
-                        master_bias = hdul[0].data
-                    image -= master_bias
-                    logger.debug("Applied bias correction to dark frame")
+    if master_frame is None:
+        return None                      # a backup was copied into place
 
-                    if type == "dark":
-                        image /= exp_time
-                        logger.debug("Normalized dark by exposure time: %.2f", exp_time)
-
-                data_cube[:, :, file_loop] = image
-
-            except Exception as e:
-                logger.error("Failed to process %s file %s: %s", type, filename, e)
-                raise
-
-        # Construct master frame by finding median of each pixel, after sigma clipping and limit
-        logger.debug("Creating master %s with clip=%.1f, nlimit=%d", type, clip, nlimit)
-        master_frame = medabsdevclip(data_cube, clip, nlimit)
-
-        # Calculate dark current for dark frames
-        if type == "dark":
-            logger.info("Calculating dark current from master dark frame...")
-            gain = config['instrument_config']['gain']
-
-            # Dark current = gain * median of master dark frame
-            # (master dark is already bias-corrected and normalized by exposure time)
-            dark_current = gain * np.median(master_frame)
-            logger.info("Calculated dark current: %.3f electrons/sec/pixel", dark_current)
-
-            # Save dark current to file
-            dark_current_file = calib_dir / "darkcurrent.txt"
-            try:
-                with open(dark_current_file, 'w') as f:
-                    f.write(f'{dark_current:.3f}\n')
-                logger.info("Saved dark current to: %s", dark_current_file)
-            except Exception as e:
-                logger.error("Failed to save dark current file: %s", e)
-
-    # Create a new FITS file with the master frame
     logger.debug("Writing master %s to: %s", type, output_file)
-
     try:
-        hdu = fits.PrimaryHDU(master_frame)
-        hdu.writeto(output_file, overwrite=True)
+        fits.PrimaryHDU(master_frame).writeto(output_file, overwrite=True)
         logger.info("Master %s frame created successfully: %s", type, output_file)
-
-        # Log some statistics about the master frame
         logger.debug("Master %s statistics: mean=%.2f, median=%.2f, std=%.2f",
-                     type, np.mean(master_frame), np.median(master_frame), np.std(master_frame))
-
-    except Exception as e:
-        logger.error("Failed to write master %s file %s: %s", type, output_file, e)
+                     type, np.mean(master_frame), np.median(master_frame),
+                     np.std(master_frame))
+    except Exception as exc:
+        logger.error("Failed to write master %s file %s: %s", type, output_file, exc)
         raise
+    return master_frame
 
 
 if __name__ == "__main__":
-    # Set up basic logging for standalone execution
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     logger.info("Running master_calibrations.py as standalone script")
-    make_master_calibration()

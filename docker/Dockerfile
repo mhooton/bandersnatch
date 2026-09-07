@@ -1,28 +1,26 @@
-# Use miniconda as base image
-FROM continuumio/miniconda3:latest
+FROM --platform=linux/amd64 python:3.12
 
-# Set working directory
-WORKDIR /app
+# Set environment variables
+ENV PYTHONPATH="/opt/bandersnatch/src:${PYTHONPATH:-}"
 
-# Copy environment file
-COPY environment.yml .
+WORKDIR /usr/src/app
 
-# Create conda environment
-RUN conda env create -f environment.yml
+# Copy and install Python requirements
+COPY docker/requirements.txt ./
+RUN pip install numpy
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Make RUN commands use the new environment
-SHELL ["conda", "run", "-n", "bandersnatch", "/bin/bash", "-c"]
+# Set up pipeline environment
+ENV BANDERSNATCH_PATH="/opt/bandersnatch/src"
+WORKDIR /opt/bandersnatch
 
-# Copy source code
-COPY ../src ./src/
+# Copy pipeline code
+COPY src/ ./src/
 
-# Set the working directory to where run.py is located
-WORKDIR /app/src
+# Create data directory
+RUN mkdir -p /data
 
-# Activate environment and set as default for container
-ENV CONDA_DEFAULT_ENV=bandersnatch
-ENV PATH=/opt/conda/envs/bandersnatch/bin:$PATH
-ENV RUNNING_IN_DOCKER=true
+# Set working directory to pipeline source
+WORKDIR /opt/bandersnatch/src
 
-# Default command - can be overridden at runtime
-ENTRYPOINT ["python", "run.py"]
+CMD ["/bin/bash"]
