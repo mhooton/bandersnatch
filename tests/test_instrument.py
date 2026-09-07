@@ -684,3 +684,43 @@ def test_fringe_map_provenance_is_checked(tmp_path):
         load_fringe_map(path, other, "z")
     with pytest.raises(ValueError, match="shape"):
         load_fringe_map(path, inst, "z", expected_shape=(99, 99))
+
+
+def test_large_scale_matches_the_direct_filter():
+    """The decimated background estimate must track the direct Gaussian."""
+    from scipy.ndimage import gaussian_filter
+    rng = np.random.default_rng(21)
+    ny, nx = 512, 512
+    yy, xx = np.mgrid[0:ny, 0:nx].astype(float)
+    background = 50 * np.sin(xx / 300) + 30 * np.cos(yy / 250)
+    fringe = 8 * np.sin(xx / 9) + 8 * np.cos(yy / 7)
+    img = background + fringe + rng.normal(0, 1.0, (ny, nx))
+
+    direct = img - gaussian_filter(img, 120, mode="nearest")
+    fast = reduction.highpass(img, 120)
+    assert fast.shape == img.shape
+    # Agreement to a few per cent of the fringe amplitude is what matters:
+    # the high-pass cut is a definitional choice, not a measurement.
+    assert np.std(direct - fast) < 0.1 * np.std(fringe)
+    assert np.corrcoef(fast.ravel(), fringe.ravel())[0, 1] > 0.85
+
+
+def test_large_scale_uses_the_direct_filter_for_small_sigma():
+    from scipy.ndimage import gaussian_filter
+    rng = np.random.default_rng(22)
+    img = rng.normal(0, 1, (64, 64))
+    assert np.allclose(reduction.large_scale(img, 4.0),
+                       gaussian_filter(img, 4.0, mode="nearest"))
+
+
+def test_large_scale_of_zero_sigma_is_zero():
+    img = np.ones((10, 10))
+    assert np.all(reduction.large_scale(img, 0) == 0)
+    assert np.allclose(reduction.highpass(img, 0), img)
+
+
+@pytest.mark.parametrize("shape", [(200, 130), (301, 199), (97, 512)])
+def test_large_scale_preserves_shape(shape):
+    rng = np.random.default_rng(23)
+    img = rng.normal(0, 1, shape)
+    assert reduction.large_scale(img, 120).shape == shape

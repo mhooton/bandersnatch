@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
-from scipy.ndimage import binary_dilation, gaussian_filter
+from scipy.ndimage import binary_dilation, gaussian_filter, zoom
 
 from utils import clean_bad_pixels
 
@@ -161,9 +161,7 @@ def prepare_fringe_template(template: np.ndarray, highpass_sigma=120.0,
     fitted scale.  Both matter: fitting the unseparated, unsmoothed map was 30
     per cent wrong in twilight and 15 to 25 per cent low elsewhere.
     """
-    t = np.asarray(template, dtype=np.float64)
-    if highpass_sigma and highpass_sigma > 0:
-        t = t - gaussian_filter(t, highpass_sigma)
+    t = highpass(np.asarray(template, dtype=np.float64), highpass_sigma)
     if smooth_sigma and smooth_sigma > 0:
         t = gaussian_filter(t, smooth_sigma)
     return t
@@ -307,17 +305,67 @@ def combine_fringe_frames(images, dtype=np.float32):
         raise ValueError("No frames to combine into a fringe map")
     first = np.asarray(images[0])
     stack = np.empty((len(images),) + first.shape, dtype=dtype)
+    any_nan = False
     for i, im in enumerate(images):
         arr = np.asarray(im, dtype=np.float64)
+        if not any_nan and not np.isfinite(arr).all():
+            any_nan = True
         stack[i] = arr - np.nanmedian(arr)
-    return np.nanmedian(stack, axis=0).astype(np.float64)
+
+    # np.nanmedian is several times slower than np.median and copies the
+    # array, which matters at 55 x 4096 x 2048. Only pay for it when a frame
+    # actually carries NaNs, which happens when bad pixels were interpolated.
+    if any_nan:
+        logger.debug("NaNs present; using the slower nan-aware median")
+        return np.nanmedian(stack, axis=0).astype(np.float64)
+    return np.median(stack, axis=0).astype(np.float64)
+
+
+def large_scale(image, sigma, max_direct_sigma=16.0):
+    """Smooth estimate of the large-scale background.
+
+    scipy's Gaussian filter uses a kernel of radius 4 sigma, so the cost grows
+    linearly with sigma: at the sigma of 120 that separates INT/WFC fringes
+    from the sky, that is a 961-tap convolution along each axis of an 8.4
+    megapixel frame, which takes minutes.
+
+    A wide Gaussian cannot resolve fine detail by definition, so for large
+    sigma the same estimate is computed on a decimated grid and interpolated
+    back. The decimation factor keeps the effective sigma at or above
+    ``max_direct_sigma`` samples, which is far more than enough to represent a
+    Gaussian.
+    """
+    image = np.asarray(image, dtype=np.float64)
+    if not sigma or sigma <= 0:
+        return np.zeros_like(image)
+    factor = max(1, int(sigma // max_direct_sigma))
+    if factor == 1:
+        return gaussian_filter(image, sigma, mode="nearest")
+
+    small = image[::factor, ::factor]
+    smoothed = gaussian_filter(small, sigma / factor, mode="nearest")
+    out = zoom(smoothed, (image.shape[0] / smoothed.shape[0],
+                          image.shape[1] / smoothed.shape[1]), order=1,
+               mode="nearest")
+    # zoom's output size can be off by a pixel; match the input exactly.
+    if out.shape != image.shape:
+        fixed = np.empty(image.shape, dtype=out.dtype)
+        ny = min(out.shape[0], image.shape[0])
+        nx = min(out.shape[1], image.shape[1])
+        fixed[:ny, :nx] = out[:ny, :nx]
+        if ny < image.shape[0]:
+            fixed[ny:, :nx] = out[-1, :nx]
+        if nx < image.shape[1]:
+            fixed[:, nx:] = fixed[:, nx - 1][:, None]
+        out = fixed
+    return out
 
 
 def highpass(image, sigma):
     """Remove the large-scale component, leaving the fringe pattern."""
     if not sigma or sigma <= 0:
         return image
-    return image - gaussian_filter(image, sigma)
+    return np.asarray(image, dtype=np.float64) - large_scale(image, sigma)
 
 
 def build_fringe_map(images, highpass_sigma=120.0):
