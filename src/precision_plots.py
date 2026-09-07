@@ -309,6 +309,54 @@ def calculate_exposure_time(photometry_dir):
         return 60.0
 
 
+def instrument_properties(instrument, system_name):
+    """Detector and telescope properties for the precision model.
+
+    Values the instrument config declares are used; the rest are the generic
+    estimates this module has always assumed, and are logged as such.
+    """
+    if instrument is None:
+        raise ValueError(
+            "An instrument is required to compute theoretical precision. "
+            "Pass --instrument-name naming a config in the configs directory.")
+
+    plate_scale = instrument.plate_scale
+    if plate_scale is None:
+        raise ValueError(
+            f"{instrument.name}.yaml does not define plate_scale (arcsec per "
+            f"pixel). It is required for the precision model, and a wrong "
+            f"value silently gives a wrong answer, so there is no default.")
+
+    read_noise = instrument.read_noise()
+    if read_noise is None:
+        read_noise = 6.0
+        logger.warning("%s.yaml does not define read_noise; assuming %.1f e-",
+                       instrument.name, read_noise)
+    saturation = instrument.saturation() or 64000
+    diameter = instrument.config.get("telescope_diameter")
+    if diameter is None:
+        diameter = 1.0
+        logger.warning("%s.yaml does not define telescope_diameter; assuming "
+                       "%.1f m", instrument.name, diameter)
+
+    props = {
+        "name": system_name,
+        "plate_scale": plate_scale,
+        "N_dc": 0.2,            # dark current [e/pix/s], generic estimate
+        "N_rn": read_noise,
+        "well_depth": saturation,
+        "well_fill": 0.7,
+        "read_time": 10.0,      # generic estimate
+        "r0": diameter / 2.0,
+        "r1": instrument.config.get("secondary_radius", 0.14 * diameter),
+    }
+    logger.info("Instrument properties: plate_scale=%.3f arcsec/px, "
+                "read_noise=%.1f e-, well_depth=%.0f e-, primary radius=%.2f m",
+                props["plate_scale"], props["N_rn"], props["well_depth"],
+                props["r0"])
+    return props
+
+
 def generate_precision_plot(target_info, teff, distance, target_flux, exp_time,
                             system_name, config_dir, observed_precision=None,
                             instrument=None):

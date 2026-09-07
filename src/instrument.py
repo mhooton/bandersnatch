@@ -18,7 +18,6 @@ from __future__ import annotations
 import glob
 import logging
 import math
-import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -157,19 +156,18 @@ def resolve_keyword(spec, header, default=None, required=False, name=""):
 
     ``spec`` may be:
       * a string, naming a single keyword;
-      * ``{"keyword": NAME, "strip": bool}``;
+      * ``{"keyword": NAME}`` (``strip`` is accepted and ignored: string
+        values are always stripped, because FITS pads them);
       * ``{"keywords": [NAME, ...]}``, first present wins;
       * ``{"expr": "..."}``, arithmetic over header values.
     """
     value = None
-    strip = False
 
     if spec is None:
         value = None
     elif isinstance(spec, str):
         value = header.get(spec)
     elif isinstance(spec, dict):
-        strip = bool(spec.get("strip", False))
         if "expr" in spec:
             try:
                 value = _eval_expr(spec["expr"], header)
