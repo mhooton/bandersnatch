@@ -623,3 +623,64 @@ def test_medabsdevclip_2d_returns_mean_and_std():
     assert out.shape == (2,)
     assert out[0] == pytest.approx(10.0, abs=0.1)
     assert out[1] == pytest.approx(2.0, abs=0.1)
+
+
+# ------------------------------------------------- fringe map construction
+
+def test_combine_fringe_frames_removes_per_frame_sky():
+    """Frames at different sky levels must combine without a level offset."""
+    rng = np.random.default_rng(11)
+    truth = _fringe(80, 70)
+    frames = [truth + sky + rng.normal(0, 0.5, truth.shape)
+              for sky in (100.0, 250.0, 400.0, 180.0, 320.0)]
+    out = reduction.combine_fringe_frames(frames)
+    assert abs(np.median(out)) < 1.0
+    assert np.corrcoef(out.ravel(), truth.ravel())[0, 1] > 0.99
+
+
+def test_highpass_leaves_the_fringe_and_removes_the_gradient():
+    truth = _fringe(200, 200)
+    ny, nx = truth.shape
+    yy, xx = np.mgrid[0:ny, 0:nx].astype(float)
+    contaminated = truth + 0.05 * xx + 0.03 * yy
+    out = reduction.highpass(contaminated, 40)
+    assert np.corrcoef(out.ravel(), truth.ravel())[0, 1] > 0.95
+    assert np.ptp(out) < np.ptp(contaminated)
+
+
+def test_build_fringe_map_equals_combine_then_highpass():
+    """make_fringe_map derives the filtered map from the unfiltered one."""
+    rng = np.random.default_rng(12)
+    frames = [_fringe(60, 50) + 100.0 + rng.normal(0, 0.5, (60, 50))
+              for _ in range(7)]
+    combined = reduction.combine_fringe_frames(frames)
+    assert np.allclose(reduction.build_fringe_map(frames, 20),
+                       reduction.highpass(combined, 20))
+
+
+def test_steps_before():
+    inst = Instrument(WFC_CFG)      # overscan, bias, flat, fringe
+    assert reduction.steps_before(inst, "flat") == ["overscan", "bias"]
+    assert reduction.steps_before(inst, "fringe") == ["overscan", "bias", "flat"]
+    assert reduction.steps_before(inst, "bias") == ["overscan"]
+    # a step the recipe does not contain leaves the chain unchanged
+    assert reduction.steps_before(inst, "dark") == inst.steps
+
+
+def test_fringe_map_provenance_is_checked(tmp_path):
+    """A map from the wrong chip must be refused, not applied."""
+    from master_calibrations import write_fringe_map, load_fringe_map
+    inst = Instrument(WFC_CFG)                       # CCD4
+    template = _fringe(40, 30)
+    path = tmp_path / "map.fits"
+    write_fringe_map(path, template, template, inst, "z", 12)
+
+    assert load_fringe_map(path, inst, "z").shape == template.shape
+
+    with pytest.raises(ValueError, match="FILTER"):
+        load_fringe_map(path, inst, "i")
+    other = Instrument(WFC_CFG, detector_name="CCD1")
+    with pytest.raises(ValueError, match="DETECTOR"):
+        load_fringe_map(path, other, "z")
+    with pytest.raises(ValueError, match="shape"):
+        load_fringe_map(path, inst, "z", expected_shape=(99, 99))

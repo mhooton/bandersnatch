@@ -290,18 +290,40 @@ def steps_before(instrument, step):
     return steps[:steps.index(step)] if step in steps else steps
 
 
-def build_fringe_map(images, highpass_sigma=120.0):
-    """Combine reduced, dithered blank-sky frames into a fringe template.
+def combine_fringe_frames(images, dtype=np.float32):
+    """Median-combine reduced, dithered blank-sky frames, sky removed.
 
-    Each frame has its own median removed, then the stack is median-combined.
-    Dithering is what removes the stars: at any pixel a star is present in at
-    most one or two frames, so the median rejects it without any star finding.
-    The large-scale component is removed last, so what is returned is the
-    fringe pattern alone.
+    Each frame has its own median subtracted, then the stack is
+    median-combined.  Dithering is what removes the stars: at any pixel a star
+    is present in at most one or two frames, so the median rejects it without
+    any star finding.
+
+    The stack is assembled in place at ``dtype``, rather than by building a
+    list and calling np.stack, because 55 INT/WFC frames are 3.7 GB in float64
+    and the list plus the stack would hold two copies of that.
     """
-    stack = np.stack([np.asarray(im, dtype=np.float64) - np.nanmedian(im)
-                      for im in images])
-    combined = np.nanmedian(stack, axis=0)
-    if highpass_sigma and highpass_sigma > 0:
-        combined = combined - gaussian_filter(combined, highpass_sigma)
-    return combined
+    images = list(images)
+    if not images:
+        raise ValueError("No frames to combine into a fringe map")
+    first = np.asarray(images[0])
+    stack = np.empty((len(images),) + first.shape, dtype=dtype)
+    for i, im in enumerate(images):
+        arr = np.asarray(im, dtype=np.float64)
+        stack[i] = arr - np.nanmedian(arr)
+    return np.nanmedian(stack, axis=0).astype(np.float64)
+
+
+def highpass(image, sigma):
+    """Remove the large-scale component, leaving the fringe pattern."""
+    if not sigma or sigma <= 0:
+        return image
+    return image - gaussian_filter(image, sigma)
+
+
+def build_fringe_map(images, highpass_sigma=120.0):
+    """Combine dithered blank-sky frames into a fringe template.
+
+    The large-scale component is removed after combining, so what is returned
+    is the fringe pattern alone.
+    """
+    return highpass(combine_fringe_frames(images), highpass_sigma)

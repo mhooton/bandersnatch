@@ -19,7 +19,8 @@ import yaml
 from astropy.io import fits
 
 from instrument import find_dated_entry
-from reduction import Reducer, build_fringe_map, steps_before
+from reduction import (Reducer, combine_fringe_frames, highpass,
+                       steps_before)
 from utils import medabsdevclip
 
 logger = logging.getLogger(__name__)
@@ -245,11 +246,15 @@ def make_fringe_map(instrument, outdir, run, config, filter, config_dir=None):
             f"Only {len(images)} usable fringe frames for filter {filter}; "
             "a median combine needs several dithered frames to reject stars")
 
-    raw_template = build_fringe_map(images, highpass_sigma=0.0)
-    template = build_fringe_map(
-        images, highpass_sigma=instrument.fringe.highpass_sigma)
+    n_frames = len(images)
+    raw_template = combine_fringe_frames(images)
+    del images                      # free the stack before filtering
+    # The high pass is applied after the median in both cases, so the filtered
+    # template follows from the unfiltered one; combining twice would double
+    # peak memory for no gain.
+    template = highpass(raw_template, instrument.fringe.highpass_sigma)
     write_fringe_map(output_file, template, raw_template, instrument, filter,
-                     len(images))
+                     n_frames)
 
 
 # --------------------------------------------------------------------------
