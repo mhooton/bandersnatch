@@ -213,19 +213,156 @@ logging:
 
 **Location**: `~/bandersnatch_runs/configs/{INSTRUMENT}.yaml`
 
-Defines instrument-specific parameters. Example for SPIRIT2:
-```yaml
-instrument_name: "SPIRIT2"
-telescope_diameter: 0.2       # Telescope diameter (meters)
-observatory_altitude: 2400    # Observatory altitude (meters)
-gain: 1.5                     # Detector gain (electrons/ADU)
-phpadu: 1.0                   # Photons per ADU
-plate_scale: 0.35             # Arcseconds per pixel
+This file is where *all* instrument-specific behaviour is declared. Adding a new
+camera should mean writing one of these and nothing else. Every key has a
+default equal to the pipeline's historical behaviour, so a config written before
+this system existed keeps working untouched.
 
+#### Minimal example (SPECULOOS cameras)
+
+```yaml
+instrument_name: "SPIRIT"
+telescope_diameter: 1.0       # metres
+observatory_altitude: 2440    # metres
+gain: 5.092                   # electrons per ADU
+phpadu: 6.36                  # photons per ADU
+plate_scale: 0.35             # arcsec per pixel (needed by precision_plots.py)
+saturation_threshold: 11000
 scintillation:
-  C_Y: 0.09                   # Scintillation constant
-  H: 8000                     # Scale height (meters)
+  C_Y: 1.56
+  H: 8000
+bad_pixel_correction:
+  hot_sigma_threshold: 5
+  cold_sigma_threshold: 5
+  flat_threshold: 0.1
+  overwrite_existing: false
 ```
+
+Everything below is inherited by default: a single-extension file, frames typed
+by `IMAGETYP` containing LIGHT/DARK/BIAS/FLAT, `FILTER`, `OBJECT`, `BJD-OBS`
+already barycentred, a `bias, dark, flat` reduction chain and raw data at
+`{topdir}/Observations/{inst}/images/{date}`.
+
+#### Full schema
+
+| Key | Default | Meaning |
+|---|---|---|
+| `raw_dir` | `{topdir}/Observations/{inst}/images/{date}` | Template for the raw frame directory. Placeholders: `{topdir}`, `{inst}`, `{date}`, `{detector}`. Overridable per night in the date config's `paths` block. |
+| `file_patterns` | `["*.fits", "*.fits.fz", "*.fts", "*.fit"]` | Glob patterns for raw frames. |
+| `search_subdirectories` | `true` | Also search one level of subdirectory. |
+| `header_hdus` | `[0]` | HDUs whose headers are merged, later entries winning. `data` means the selected detector's own HDU. |
+| `detectors` | one detector, HDU 0 | Per-detector geometry and properties (below). |
+| `default_detector` | first defined | Which detector to process. Override with `instrument_settings.detector` or `--detector`. |
+| `coordinates` | `trimmed` | Whether star positions in `targets.yaml` are `raw` (untrimmed) or `trimmed` pixels. |
+| `keywords` | SPECULOOS names | How to read each metadata item (below). |
+| `time` | `BJD-OBS`, already barycentric | How to derive mid-exposure BJD_TDB (below). |
+| `observatory` | none | `{lat, lon, height}` in degrees and metres. Enables the barycentric correction and the solar-midnight dusk/dawn split. |
+| `classification` | `IMAGETYP` substrings | Ordered frame-typing rules (below). |
+| `dome_flat` | none | A rule matching dome flats, so they form their own session. |
+| `flat_sources` | all | Restrict which flat sessions are combined, e.g. `[sky]` or `[dome]`. |
+| `reduction.steps` | `[bias, dark, flat]` | The ordered reduction recipe. |
+| `reduction.overscan` | `{method: median}` | `median` (a per-frame scalar), `row_median`, or `polynomial` with `order`. |
+| `fringe` | see below | Fringe-map and fringe-fit settings. |
+| `plate_scale` | none | Arcsec per pixel. Required by `precision_plots.py`. |
+
+**Detectors.** One entry per readout. `trim` and `overscan` are FITS sections,
+1-based and inclusive, x first, exactly as they appear in headers.
+
+```yaml
+detectors:
+  CCD4:
+    hdu: extension4          # integer index or EXTNAME
+    trim: "[54:2101,1:4096]"
+    overscan: "[2102:2154,1:4096]"
+    gain: 2.9                # electrons per ADU
+    read_noise: 5.8          # electrons
+    saturation: 65535
+    bad_columns: [1743, 1744]  # trimmed x, seeds the bad pixel map
+default_detector: CCD4
+```
+
+One detector is processed per run. To reduce a second chip, run again with
+`--detector CCD2`.
+
+**Keywords.** Four forms, so that fallbacks and simple derivations need no code:
+
+```yaml
+keywords:
+  exptime: EXPTIME                                   # a single keyword
+  filter: {keyword: WFFBAND, strip: true}            # values are always stripped
+  airmass: {keywords: [AIRMASS, AMSTART]}            # first one present wins
+  altitude: {expr: "90 - 0.5*(ZDSTART + ZDEND)"}     # arithmetic on header values
+```
+
+Expressions see header values plus a few maths functions, and nothing else.
+
+**Time.** The pipeline records mid-exposure BJD_TDB.
+
+```yaml
+time:
+  keyword: MJD-OBS      # which keyword holds the timestamp
+  format: mjd           # mjd | jd | isot
+  scale: utc            # utc | tdb
+  reference: start      # start (adds half the exposure) | mid
+  barycentric: false    # true if the keyword is already barycentred
+```
+
+The default is `{keyword: BJD-OBS, format: jd, scale: tdb, reference: mid,
+barycentric: true}`, a pass-through. When `barycentric` is false the correction
+is applied towards the target's `ra`/`dec` from `targets.yaml`. A missing time
+keyword is an error: a frame index is not a time.
+
+**Classification.** An ordered list; the first match wins, and a frame matching
+nothing is ignored and logged. Values match exactly after stripping, or use
+`{regex: ...}`, `{contains: ...}` or `{equals: ...}`. Multiple keys in one
+`where` are ANDed.
+
+```yaml
+classification:
+  - {type: bias,    where: {OBSTYPE: BIAS}}
+  - {type: ignore,  where: {OBJECT: {regex: "(?i)^NLtest"}}}
+  - {type: flat,    where: {OBJECT: {regex: "(?i)flat"}}}
+  - {type: fringe,  where: {OBJECT: {regex: "(?i)fringe"}}}
+  - {type: science, where: {OBSTYPE: TARGET}}
+```
+
+Order matters. In the example above the linearity-test frames are excluded
+before the flat rule can claim them.
+
+**Reduction recipe.** An ordered list of steps, validated at start-up:
+`overscan` must come first, `dark` requires `bias`, `fringe` must follow `flat`.
+Missing calibration products are reported before any frame is read.
+
+```yaml
+reduction:
+  steps: [overscan, bias, flat, fringe]
+  overscan: {method: median}
+```
+
+**Fringe correction.** Used when `fringe` is in the recipe.
+
+```yaml
+fringe:
+  highpass_sigma: 120        # separates large-scale sky from the fringe pattern
+  template_smooth_sigma: 2   # suppresses template noise; see the warning below
+  star_mask: {smooth: 3, threshold_mad: 4, dilate: 12, border: 40}
+  fit: {plane: true, clip_sigma: 3, iterations: 3, subsample: 7}
+```
+
+The scale factor is fitted over the whole image rather than from a pair of
+hand-placed boxes: on INT/WFC data the whole-image fit repeats to 1 per cent
+between even and odd rows, where a single box pair scatters by about 20 per
+cent. **Do not set `template_smooth_sigma` to zero.** Fitting against a template
+that carries its own pixel noise biases the recovered scale low, by 15 to 25 per
+cent on real data.
+
+#### Example: INT Wide Field Camera
+
+See `configs/WFC.yaml` for a complete multi-detector example. It exercises every
+part of the schema: four extensions with per-chip gains, overscan and trim
+sections, `OBSTYPE`/`OBJECT` classification, `WFFBAND` for the filter, altitude
+derived from zenith distance, `MJD-OBS` converted to BJD, raw star coordinates,
+and an `overscan, bias, flat, fringe` recipe with no dark step.
 
 ### Targets Configuration
 
@@ -268,6 +405,41 @@ targets:
 5. Calculates offset between your `star0_positions` (from date config) and reference
 6. Applies that offset to all stars
 
+**Target coordinates.** Add `ra` and `dec` to each entry. They are used for the
+barycentric time correction, and are required whenever the instrument's `time`
+block is not already barycentric. Without them the telescope pointing is used
+instead, with a warning; that is accurate to about a millisecond for an on-axis
+target.
+
+```yaml
+targets:
+  KELT16:
+    - start_date: "20170101"
+      ra: "20:57:04.4386"
+      dec: "+31:39:39.631"
+      tracking_star: 0
+      all_star_positions:
+        - [263.0, 1924.6]     # raw, untrimmed CCD4 pixels
+        - [486.0, 3263.0]
+```
+
+**Which pixel coordinates?** Positions are read off raw frames, before trimming,
+which is what you have before a first reduction. An instrument that trims
+declares `coordinates: raw` and the pipeline removes the trim offset once, at
+config load, logging the conversion on every run:
+
+```
+KELT16 star 0: raw (263.0, 1924.6) -> trimmed (210.0, 1924.6), offset (-53, -0)
+```
+
+Everything downstream, including `centroids.fits`, the photometry tables and the
+diagnostic plots, is in trimmed coordinates. Processed frames carry `LTV1` and
+`LTV2`, so DS9 reports raw coordinates in its *physical* readout and a raw frame
+and a processed frame can be compared position for position.
+
+Note that bandersnatch positions are numpy 0-based while DS9 displays 1-based
+FITS coordinates, so a position read from DS9 needs 1 subtracted from each axis.
+
 **Legacy format** (single config, no dates):
 ```yaml
 targets:
@@ -301,6 +473,42 @@ The pipeline will:
 1. Try to create flats from the current night's data
 2. If insufficient flats, use the most recent backup from `master_flats.yaml`
 3. If `force_backup_flats: true` in date config, always use backup flats
+
+### Fringe Maps Configuration
+
+**Location**: `~/bandersnatch_runs/configs/fringe_maps.yaml` (optional)
+
+Lets one fringe map serve a whole observing run, or a night with too few
+dithered blank-sky frames borrow one. The pattern is fixed by the CCD and only
+its amplitude varies, which the per-frame scale factor handles. Keyed by filter
+and then detector, because a fringe map belongs to one chip as much as to one
+filter.
+
+```yaml
+maps:
+  z:                              # filter
+    CCD4:                         # detector; 'default' for single-detector instruments
+      - start_date: "20170801"
+        path: "/Users/matthewhooton/bandersnatch_runs/WFC_20170805/calib/1_fringe_map_z.fits"
+      - start_date: "20200101"
+        path: "/Users/matthewhooton/bandersnatch_runs/WFC_20200118/calib/1_fringe_map_z.fits"
+```
+
+The entry used is the one with the latest `start_date` at or before the
+observation date, the same rule as `master_flats.yaml`.
+
+Resolution order for the fringe map:
+
+1. `calibration_params.force_backup_fringe_map: true` forces the config lookup.
+2. Otherwise build from this night's fringe frames.
+3. Otherwise `fringe_maps.yaml` for this filter, detector and date.
+4. Otherwise `calibration_params.backup_fringe_maps: {z: "/path"}`.
+5. Otherwise an error naming the filter, detector and date.
+
+Every map records `INSTRUME`, `DETECTOR`, `FILTER`, `NFRAMES` and `TRIMSEC` in
+its header, and these are checked on load. A map built for a different chip or
+filter is refused rather than applied: it would produce a plausible-looking but
+wrong correction.
 
 ## Usage
 
@@ -635,7 +843,48 @@ calibration_params:
 3. If not in `master_flats.yaml` → use `backup_master_flats` (legacy)
 4. If `force_backup_flats: true` → skip step 1, go straight to backup
 
+### 4b. Fringe Map Creation (`to_make_fringe_map`)
+
+Runs only when `fringe` is in the instrument's reduction recipe.
+
+**What it does**:
+1. Reduces each dithered blank-sky frame through every step before `fringe`
+2. Subtracts each frame's own median, then median-combines the stack
+3. Removes the large-scale component with a wide high-pass filter
+4. Writes `{run}_fringe_map_{filter}.fits`, with the unfiltered version in a
+   second extension and provenance keywords in the header
+
+Dithering is what removes the stars: at any pixel a star appears in at most one
+or two frames, so the median rejects it without any star finding. On the INT/WFC
+night of 2017-08-05, 0.004 per cent of star-free pixels survived above 5 MAD.
+
+**Output**: `calib/{run}_fringe_map_{filter}.fits`
+
+**Requirements**: at least three dithered frames, or an entry in
+`fringe_maps.yaml`.
+
 ### 5. Science Frame Reduction (`to_reduce_science_images`)
+
+The reduction chain is the instrument's `reduction.steps`, applied in order.
+For the SPECULOOS cameras that is `bias, dark, flat`; for INT/WFC it is
+`overscan, bias, flat, fringe`. Two steps are worth describing:
+
+**Overscan** measures the bias level from the overscan strip on every frame and
+subtracts it. This matters when the bias level drifts: on INT/WFC it moves by 10
+to 50 ADU through a night against a z-band sky of about 200 ADU. The section
+comes from the instrument config, never from the `BIASSEC` keyword, which on
+WFC's CCD2 points at illuminated pixels. Trimming to the illuminated area
+happens immediately afterwards, so everything downstream is in trimmed
+coordinates.
+
+**Fringe subtraction** scales the fringe map to each frame and subtracts it. The
+scale is fitted over the whole image, using every star-free pixel, against a
+smoothed and high-passed template, with a plane term to absorb the sky gradient.
+Only `scale x template` is subtracted; the sky and its gradient are left for the
+photometry's own annulus. The fitted scale is recorded per frame in
+`frames.fits` and tracks the OH airglow through the night, which makes it a
+natural decorrelation vector.
+
 
 **What it does**: Applies calibrations to science images.
 

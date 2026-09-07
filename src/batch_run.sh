@@ -250,24 +250,34 @@ clear_state() {
 }
 
 # Function to extract paths from config file
+#
+# Asks run.py to resolve them rather than re-deriving the directory layout
+# here. The layout is instrument-specific (INT/WFC data is not laid out like
+# SPECULOOS data), and duplicating the rules in shell is how staged mode came
+# to be broken against the current run.py.
 get_config_paths() {
     local config_file="$1"
-    local inst date topdir_config
+    local output
 
-    # Extract instrument and date from config
-    inst=$(python3 -c "import yaml; config=yaml.safe_load(open('$config_file')); print(config['instrument_settings']['inst'])" 2>/dev/null)
-    date=$(python3 -c "import yaml; config=yaml.safe_load(open('$config_file')); print(config['instrument_settings']['date'])" 2>/dev/null)
-    topdir_config=$(python3 -c "import yaml; config=yaml.safe_load(open('$config_file')); print(config['paths']['topdir'])" 2>/dev/null)
-
-    if [[ -z "$inst" || -z "$date" || -z "$topdir_config" ]]; then
-        log_error "Failed to extract paths from config: $config_file"
+    if ! output=$(python3 "$PYTHON_SCRIPT" "$config_file" --print-paths 2>/dev/null); then
+        log_error "Failed to resolve paths from config: $config_file"
         return 1
     fi
 
-    # Expand tilde in topdir_config
-    topdir_config=$(eval echo "$topdir_config")
+    local inst date run_name rawdir outdir topdir
+    inst=$(echo "$output" | sed -n 's/^INST=//p')
+    date=$(echo "$output" | sed -n 's/^DATE=//p')
+    run_name=$(echo "$output" | sed -n 's/^RUN_NAME=//p')
+    topdir=$(echo "$output" | sed -n 's/^TOPDIR=//p')
+    rawdir=$(echo "$output" | sed -n 's/^RAWDIR=//p')
+    outdir=$(echo "$output" | sed -n 's/^OUTDIR=//p')
 
-    echo "$inst" "$date" "$topdir_config"
+    if [[ -z "$inst" || -z "$date" || -z "$rawdir" || -z "$outdir" ]]; then
+        log_error "Incomplete paths from config: $config_file"
+        return 1
+    fi
+
+    echo "$inst" "$date" "$topdir" "$run_name" "$rawdir" "$outdir"
 }
 
 # Function to copy raw data to local staging
@@ -277,7 +287,7 @@ copy_raw_data() {
 
     # Get paths from config
     local paths=($(get_config_paths "$config"))
-    if [[ ${#paths[@]} -ne 3 ]]; then
+    if [[ ${#paths[@]} -ne 6 ]]; then
         log_error "Failed to get paths for config: $config"
         return 1
     fi
@@ -285,8 +295,7 @@ copy_raw_data() {
     local inst="${paths[0]}"
     local date="${paths[1]}"
     local topdir_config="${paths[2]}"
-
-    local raw_source_dir="${topdir_config}/data/${inst}/${date}"
+    local raw_source_dir="${paths[4]}"
     local local_staging_base="${LOCAL_STAGING_DIR}/${config_basename}"
     local local_raw_dir="${local_staging_base}/raw"
 
@@ -300,12 +309,14 @@ copy_raw_data() {
         return 1
     fi
 
-    # Create staging directory structure
+    # Mirror the source layout under the staging root, so that running with
+    # --topdir "$local_staging_base" finds the frames where it expects them.
+    local staged_raw="${local_staging_base}${raw_source_dir#$topdir_config}"
     mkdir -p "$local_raw_dir"
-    mkdir -p "${local_staging_base}/data/${inst}/${date}"
+    mkdir -p "$staged_raw"
 
     # Copy raw data
-    if cp -r "$raw_source_dir"/* "${local_staging_base}/data/${inst}/${date}"/; then
+    if cp -r "$raw_source_dir"/* "$staged_raw"/; then
         set_state "$config" "raw_ready"
         log_success "Raw data copy completed for $config"
         return 0
@@ -322,18 +333,14 @@ copy_output_data() {
 
     # Get paths from config
     local paths=($(get_config_paths "$config"))
-    if [[ ${#paths[@]} -ne 3 ]]; then
+    if [[ ${#paths[@]} -ne 6 ]]; then
         log_error "Failed to get paths for config: $config"
         return 1
     fi
 
-    local inst="${paths[0]}"
-    local date="${paths[1]}"
-    local topdir_config="${paths[2]}"
-
-    local run_name="${inst}_${date}"
+    local run_name="${paths[3]}"
+    local output_dest_dir="${paths[5]}"
     local local_output_dir="${LOCAL_STAGING_DIR}/${config_basename}/bandersnatch_runs/${run_name}"
-    local output_dest_dir="${topdir_config}/bandersnatch_runs/${run_name}"
 
     log_info "Starting output data copy for $config"
     log_info "  Source: $local_output_dir"
