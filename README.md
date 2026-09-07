@@ -191,6 +191,8 @@ photometry_settings:
   SKYRAD_inner: 15             # Inner radius of sky annulus (pixels)
   SKYRAD_outer: 25             # Outer radius of sky annulus (pixels)
   sky_suppress: false          # Force sky to near-zero (for testing)
+  exact_apertures: false       # true = exact pixel/circle overlap weights (IDL APER /EXACT);
+                               # false = approximate pixel fractions (default, ~10x faster)
 
 paths:
   topdir: "/data/SPECULOOSPipeline"  # Server path, or local mirror e.g. "/Volumes/my_drive"
@@ -1022,6 +1024,7 @@ photometry_settings:
   aper_max: 12              # Largest aperture
   SKYRAD_inner: 15          # Sky annulus inner radius
   SKYRAD_outer: 25          # Sky annulus outer radius
+  exact_apertures: false    # Exact geometric pixel weights at the aperture edge (IDL /EXACT)
 ```
 
 **Output table columns** (per aperture):

@@ -88,6 +88,7 @@ def process_images_streaming(instrument, reducer, outdir, run, target, config,
     skyrad = np.array([photometry_params["SKYRAD_inner"],
                        photometry_params["SKYRAD_outer"]])
     setskyval = 1e-20 if photometry_params["sky_suppress"] else None
+    exact = photometry_params.get("exact", False)
 
     for aper_radius in apr:
         photometry_results[f"aper{int(aper_radius)}"] = {
@@ -141,7 +142,8 @@ def process_images_streaming(instrument, reducer, outdir, run, target, config,
             yc_frame = centroid_result["yc"]
             mags, errap, sky, skyerr = aper(
                 image=image, xc=xc_frame, yc=yc_frame, phpadu=phpadu, apr=apr,
-                skyrad=skyrad, setskyval=setskyval, flux=True, silent=True)
+                skyrad=skyrad, setskyval=setskyval, flux=True, silent=True,
+                exact=exact)
 
             n_bad_pix_aperture = count_bad_pixels_in_apertures(
                 bad_pixel_map, image.shape, xc_frame, yc_frame, apr, n_stars)

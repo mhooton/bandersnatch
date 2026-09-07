@@ -1050,7 +1050,8 @@ def main():
                         'aper_max': photometry_settings['aper_max'],
                         'SKYRAD_inner': photometry_settings['SKYRAD_inner'],
                         'SKYRAD_outer': photometry_settings['SKYRAD_outer'],
-                        'sky_suppress': photometry_settings['sky_suppress']
+                        'sky_suppress': photometry_settings['sky_suppress'],
+                        'exact': photometry_settings.get('exact_apertures', False)
                     }
 
                     try:
@@ -1142,7 +1143,8 @@ def main():
                                        photometry_settings['SKYRAD_inner'],
                                        photometry_settings['SKYRAD_outer'],
                                        photometry_settings['sky_suppress'],
-                                       bad_pixel_map=bpm)
+                                       bad_pixel_map=bpm,
+                                       exact=photometry_settings.get('exact_apertures', False))
                             logger.info(f"Aperture photometry completed for {target}")
                         except Exception as e:
                             logger.error(f"Failed to perform aperture photometry for {target}: {e}")

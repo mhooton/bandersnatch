@@ -115,7 +115,7 @@ def write_photometry_results(photometry_dir, photometry_results, config, target,
     return aperture_tables
 
 def photometry(outdir, run, target, config, aper_min, aper_max, SKYRAD_inner, SKYRAD_outer, sky_suppress,
-               median_filter_window=21, time_bin_size=0.005, bad_pixel_map=None):
+               median_filter_window=21, time_bin_size=0.005, bad_pixel_map=None, exact=False):
     """
     Perform aperture photometry on all processed images for a given target.
 
@@ -145,6 +145,10 @@ def photometry(outdir, run, target, config, aper_min, aper_max, SKYRAD_inner, SK
         Time bin size for diagnostic plots
     bad_pixel_map : np.ndarray or None
         Boolean bad pixel map
+    exact : bool
+        Weight boundary pixels by their exact geometric overlap with the
+        aperture (the IDL APER /EXACT keyword) instead of the default
+        approximate pixel-fraction method
     """
     logger.info("Starting aperture photometry for target %s", target)
 
@@ -187,6 +191,7 @@ def photometry(outdir, run, target, config, aper_min, aper_max, SKYRAD_inner, SK
     logger.info("  Apertures: %s", apr)
     logger.info("  Sky annulus: %s", skyrad)
     logger.info("  Sky suppression: %s", sky_suppress)
+    logger.info("  Exact aperture weighting: %s", exact)
     logger.info("  Median filter window: %d", median_filter_window)
 
     # 3. Create photometry directory
@@ -231,7 +236,8 @@ def photometry(outdir, run, target, config, aper_min, aper_max, SKYRAD_inner, SK
                 skyrad=skyrad,
                 setskyval=setskyval,
                 flux=True,
-                silent=True
+                silent=True,
+                exact=exact
             )
 
             # Count bad pixels in apertures using shared function

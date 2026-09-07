@@ -832,11 +832,13 @@ def aper(image: np.ndarray,
         x_indices = np.arange(nx[i])  # x second
         dxsq = (x_indices - dx[i]) ** 2
         dysq = (y_indices - dy[i]) ** 2
-        rsq = np.zeros((ny[i], nx[i]))
-        for ii in range(ny[i]):
-            rsq[ii, :] = dxsq + (ii - dy[i]) ** 2
+        rsq = dxsq[np.newaxis, :] + dysq[:, np.newaxis]
 
         if exact:
+            # Pixel-centre coordinates within the subarray, same shape as
+            # rotbuf (ny, nx). Equivalent to the IDL
+            #   xx = nbox mod nx,  yy = nbox / nx
+            xx, yy = np.meshgrid(x_indices, y_indices)
             x1 = np.abs(xx - dx[i])
             y1 = np.abs(yy - dy[i])
         else:
@@ -904,7 +906,7 @@ def aper(image: np.ndarray,
 
                 if exact:
                     # Exact photometry using PIXWT
-                    mask = np.zeros((nx[i], ny[i]))
+                    mask = np.zeros((ny[i], nx[i]))
                     good = (x1 < smallrad[k]) & (y1 < smallrad[k])
                     mask[good] = 1.0
                     bad = (x1 > bigrad[k]) | (y1 > bigrad[k])
