@@ -1093,8 +1093,10 @@ def main():
                             seq_reducer = Reducer(instrument, seq_calib,
                                                   bad_pixel_map=bpm,
                                                   fringe_template=seq_fringe)
-                            _ = reduce_science_frames(instrument, seq_reducer, outdir,
-                                                      inst_settings['run'], target)
+                            _ = reduce_science_frames(
+                                instrument, seq_reducer, outdir,
+                                inst_settings['run'], target,
+                                target_coord=target_coords[i])
                             logger.info(f"Science frame reduction completed for {target}")
                         except Exception as e:
                             logger.error(f"Failed to reduce science frames for {target}: {e}")

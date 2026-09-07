@@ -39,7 +39,8 @@ def annotate_header(header, instrument, record):
     return header
 
 
-def reduce_science_frames(instrument, reducer, outdir, run, target):
+def reduce_science_frames(instrument, reducer, outdir, run, target,
+                          target_coord=None):
     """Reduce every science frame for ``target``; return the per-frame records."""
     logger.info("Starting science frame reduction for target %s", target)
 
@@ -75,6 +76,7 @@ def reduce_science_frames(instrument, reducer, outdir, run, target):
             output_filenames.append(output_filename)
             record = dict(record)
             record.update(file=str(filename), processed=output_filename,
+                          bjd_mid=instrument.compute_bjd(frame.meta, target_coord),
                           exptime=frame.meta.exptime, airmass=frame.meta.airmass,
                           altitude=frame.meta.altitude, filter=frame.meta.filter)
             records.append(record)
@@ -88,6 +90,11 @@ def reduce_science_frames(instrument, reducer, outdir, run, target):
     if not output_filenames:
         raise RuntimeError(
             f"No science frames were successfully reduced for target {target}")
+
+    # The per-frame table is what later stages read instead of reopening raw
+    # files, so the sequential path must write it too.
+    from streaming_processor import write_frames_table
+    write_frames_table(outdir / target, records)
 
     write_liste(output_filenames, f"{run}_proc_{target}.list", outdir)
     logger.info("Created processed frame list: %s_proc_%s.list with %d files",
