@@ -10,6 +10,9 @@ import logging
 import logging.handlers
 from pathlib import Path
 import yaml
+
+from instrument import load_instrument
+from reduction import Reducer
 from astropy.io import fits
 
 from create_lists import create_lists
@@ -103,22 +106,33 @@ def find_target_config_for_date(targets_config, target_name, observation_date):
         return target_config
 
 
-def load_instrument_config(instrument_name, config_dir):
-    """Load instrument-specific YAML configuration file."""
-    instrument_config_path = config_dir / f"{instrument_name}.yaml"
+def build_instrument(config, config_dir):
+    """Load the Instrument for this run, honouring date-config overrides."""
+    inst_settings = config['instrument_settings']
     try:
-        with open(instrument_config_path, 'r') as f:
-            instrument_config = yaml.safe_load(f)
-        return instrument_config
-    except FileNotFoundError:
-        print(f"Error: Instrument config file '{instrument_config_path}' not found.")
-        sys.exit(1)
-    except yaml.YAMLError as e:
-        print(f"Error parsing instrument YAML config file: {e}")
+        instrument = load_instrument(
+            inst_settings['inst'], config_dir,
+            detector=inst_settings.get('detector'),
+            raw_dir_override=config.get('paths', {}).get('raw_dir'))
+    except (FileNotFoundError, ValueError, KeyError) as exc:
+        print(f"Error loading instrument config: {exc}")
         sys.exit(1)
 
+    # Deprecated: image_extension used to live in the date config.
+    legacy_ext = config.get('calibration_params', {}).get('image_extension')
+    if legacy_ext is not None and not config.get('_ext_warned'):
+        if instrument.config.get('detectors') is None:
+            instrument.detector.hdu = legacy_ext
+        logging.getLogger(__name__).warning(
+            "calibration_params.image_extension is deprecated; declare the HDU "
+            "under 'detectors' in %s.yaml instead", inst_settings['inst'])
+        config['_ext_warned'] = True
+    config['instrument_config'] = instrument.config
+    return instrument
 
-def resolve_target_positions(date_config, targets_config, all_targets):
+
+def resolve_target_positions(date_config, targets_config, all_targets,
+                             instrument=None):
     """
     Resolve target positions and tracking stars using targets.yaml configuration.
     Now supports both dictionary and list formats for star0_positions, with dictionary
@@ -177,6 +191,7 @@ def resolve_target_positions(date_config, targets_config, all_targets):
 
     initial_positions = []
     tracking_stars = []
+    target_coords = []
 
     logger.info("Resolving positions for %d targets using targets.yaml", len(targets_to_process))
 
@@ -228,11 +243,41 @@ def resolve_target_positions(date_config, targets_config, all_targets):
 
         logger.debug("Tracking star for %s: %d", target, tracking_star)
 
+        # Configured positions are eyeballed on raw frames; the pipeline works
+        # on trimmed images. Convert once, here, and say so in the log.
+        if instrument is not None:
+            if instrument.coordinates == 'raw' and instrument.detector.trim:
+                logger.info(instrument.describe_coord_conversion(
+                    target, adjusted_positions))
+            adjusted_positions = instrument.to_trimmed_coords(
+                adjusted_positions).tolist()
+
+        # Sky coordinates for the barycentric correction.
+        coord = None
+        ra, dec = target_info.get('ra'), target_info.get('dec')
+        if ra is not None and dec is not None:
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            try:
+                coord = (SkyCoord(ra, dec, unit=(u.hourangle, u.deg))
+                         if isinstance(ra, str) else
+                         SkyCoord(float(ra), float(dec), unit=u.deg))
+                logger.info("Target %s at %s (used for the BJD correction)",
+                            target, coord.to_string('hmsdms'))
+            except Exception as exc:
+                logger.warning("Could not parse ra/dec for %s: %s", target, exc)
+        else:
+            logger.warning("No ra/dec in targets.yaml for %s; the barycentric "
+                           "correction will use the telescope pointing, which "
+                           "is accurate to about a millisecond for an on-axis "
+                           "target", target)
+
         initial_positions.append(adjusted_positions)
         tracking_stars.append(tracking_star)
+        target_coords.append(coord)
 
     logger.info("Successfully resolved positions for %d targets", len(targets_to_process))
-    return targets_to_process, initial_positions, tracking_stars
+    return targets_to_process, initial_positions, tracking_stars, target_coords
 
 
 def copy_config_files(config_path, targets_config, targets_used, outdir, config):
@@ -378,6 +423,13 @@ def parse_arguments():
     parser.add_argument('--date', help='Override observation date (YYYYMMDD)')
     parser.add_argument('--inst', help='Override instrument name')
     parser.add_argument('--run', help='Override run number')
+    parser.add_argument('--detector',
+                        help='Override which detector to process (multi-detector '
+                             'instruments only)')
+    parser.add_argument('--print-paths', action='store_true',
+                        help='Print the resolved paths for this config and exit. '
+                             'Used by batch_run.sh so that the directory layout '
+                             'is defined in one place only.')
 
     # Processing step flags - use separate attributes to avoid conflicts
     parser.add_argument('--make-lists', action='store_true',
@@ -474,6 +526,8 @@ def merge_config_with_args(config, args):
         config['instrument_settings']['inst'] = args.inst
     if args.run:
         config['instrument_settings']['run'] = args.run
+    if getattr(args, 'detector', None):
+        config['instrument_settings']['detector'] = args.detector
 
     # Update run_name (always generated from inst and date)
     inst = config['instrument_settings']['inst']
@@ -578,15 +632,22 @@ def merge_config_with_args(config, args):
     return config
 
 
-def setup_paths(config):
-    """Set up paths based on topdir from config file."""
+def _first_science_file(outdir, run, target):
+    """First entry of a target's science list, for reading the filter."""
+    with open(outdir / "calib" / f"{run}_image_{target}.list") as f:
+        return f.readline().strip()
+
+
+def setup_paths(config, instrument):
+    """Resolve the raw and output directories for this run.
+
+    The raw-directory layout is the instrument's, so an instrument whose data
+    is not laid out in the SPECULOOS way needs no code change here.
+    """
     inst_settings = config['instrument_settings']
-    path_settings = config['paths']
-
-    topdir = Path(path_settings['topdir']).expanduser()
-    rawdir = topdir / "Observations" / inst_settings['inst'] / "images" / inst_settings['date']
+    topdir = Path(config['paths']['topdir']).expanduser()
+    rawdir = instrument.raw_dir(topdir, inst_settings['date'])
     outdir = topdir / "bandersnatch_runs" / inst_settings['run_name']
-
     return topdir, rawdir, outdir
 
 
@@ -635,8 +696,7 @@ def main():
     # Load instrument configuration
     config_dir = Path(config_path).parent
     config['_config_dir'] = str(config_dir)
-    instrument_config = load_instrument_config(config['instrument_settings']['inst'], config_dir)
-    config['instrument_config'] = instrument_config
+    instrument = build_instrument(config, config_dir)
 
     # Extract configuration sections
     inst_settings = config['instrument_settings']
@@ -647,7 +707,18 @@ def main():
     # path_settings = config['paths']
 
     # Set up paths with staging support
-    topdir, rawdir, outdir = setup_paths(config)
+    topdir, rawdir, outdir = setup_paths(config, instrument)
+
+    if getattr(args, 'print_paths', False):
+        print(f"INST={instrument.name}")
+        print(f"DETECTOR={instrument.detector.name}")
+        print(f"DATE={inst_settings['date']}")
+        print(f"RUN={inst_settings['run']}")
+        print(f"RUN_NAME={inst_settings['run_name']}")
+        print(f"TOPDIR={topdir}")
+        print(f"RAWDIR={rawdir}")
+        print(f"OUTDIR={outdir}")
+        return
 
     caldir = outdir / "calib"
 
@@ -658,7 +729,9 @@ def main():
 
     # Log which config file was used
     logger.info("Using config file: %s", config_path)
-    logger.info("Using instrument config: %s", instrument_config['instrument_name'])
+    logger.info("Using instrument config: %s (detector %s)",
+                instrument.name, instrument.detector.name)
+    logger.info("Reduction steps: %s", " -> ".join(instrument.steps))
 
     logger.info("=" * 60)
     logger.info(f"Starting astronomy pipeline for {inst_settings['inst']}")
@@ -689,9 +762,11 @@ def main():
         else:
             logger.info("Creating file lists...")
             try:
-                _ = create_lists(rawdir, outdir, inst_settings['run'],
-                                 ext='fits',
-                                 discard_n_first_science=inst_settings['discard_n_first_science'])
+                _ = create_lists(
+                    instrument, rawdir, outdir, inst_settings['run'],
+                    topdir=topdir,
+                    discard_n_first_science=inst_settings['discard_n_first_science'],
+                    raw_dir_template=config.get('paths', {}).get('raw_dir'))
                 logger.info("File lists created successfully")
             except Exception as e:
                 logger.error(f"Failed to create file lists: {e}")
@@ -707,10 +782,10 @@ def main():
         else:
             logger.info("Creating master bias...")
             try:
-                _ = make_master_calibration("bias", outdir, inst_settings['run'], inst_settings['inst'], config,
-                                            image_extension=calib_params['image_extension'],
-                                            clip=calib_params['bias_MAD_clip'],
-                                            nlimit=calib_params['bias_MAD_nlimit'])
+                _ = make_master_calibration(
+                    "bias", outdir, inst_settings['run'], instrument, config,
+                    clip=calib_params['bias_MAD_clip'],
+                    nlimit=calib_params['bias_MAD_nlimit'], config_dir=config_dir)
                 logger.info("Master bias created successfully")
             except Exception as e:
                 logger.error(f"Failed to create master bias: {e}")
@@ -726,10 +801,10 @@ def main():
         else:
             logger.info("Creating master dark...")
             try:
-                _ = make_master_calibration("dark", outdir, inst_settings['run'], inst_settings['inst'], config,
-                                            image_extension=calib_params['image_extension'],
-                                            clip=calib_params['dark_MAD_clip'],
-                                            nlimit=calib_params['dark_MAD_nlimit'])
+                _ = make_master_calibration(
+                    "dark", outdir, inst_settings['run'], instrument, config,
+                    clip=calib_params['dark_MAD_clip'],
+                    nlimit=calib_params['dark_MAD_nlimit'], config_dir=config_dir)
                 logger.info("Master dark created successfully")
             except Exception as e:
                 logger.error(f"Failed to create master dark: {e}")
@@ -766,12 +841,12 @@ def main():
                                     flat_file)
                             else:
                                 logger.info(f"Processing filter {filter} from master flats config")
-                                _ = make_master_calibration("flat", outdir, inst_settings['run'], inst_settings['inst'],
-                                                            config,
-                                                            filter=filter,
-                                                            image_extension=calib_params['image_extension'],
-                                                            clip=calib_params['flat_MAD_clip'],
-                                                            nlimit=calib_params['flat_MAD_nlimit'])
+                                _ = make_master_calibration(
+                                    "flat", outdir, inst_settings['run'],
+                                    instrument, config, filter=filter,
+                                    clip=calib_params['flat_MAD_clip'],
+                                    nlimit=calib_params['flat_MAD_nlimit'],
+                                    config_dir=config_dir)
                                 logger.info(f"Master flat for filter {filter} processed successfully")
                     else:
                         raise ValueError("No filters found in flat lists or master flats config")
@@ -792,18 +867,40 @@ def main():
                                         flat_file)
                         else:
                             logger.info(f"Creating master flat for filter {filter}")
-                            _ = make_master_calibration("flat", outdir, inst_settings['run'], inst_settings['inst'],
-                                                        config,
-                                                        filter=filter,
-                                                        image_extension=calib_params['image_extension'],
-                                                        clip=calib_params['flat_MAD_clip'],
-                                                        nlimit=calib_params['flat_MAD_nlimit'])
+                            _ = make_master_calibration(
+                                "flat", outdir, inst_settings['run'],
+                                instrument, config, filter=filter,
+                                clip=calib_params['flat_MAD_clip'],
+                                nlimit=calib_params['flat_MAD_nlimit'],
+                                config_dir=config_dir)
                             logger.info(f"Master flat for filter {filter} created successfully")
 
             logger.info("All master flats created successfully")
         except Exception as e:
             logger.error(f"Failed to create master flats: {e}")
             raise
+
+    # Make fringe map(s)
+    if 'fringe' in instrument.steps:
+        if proc_flags.get('to_make_fringe_map', True):
+            logger.info("Creating fringe map(s)...")
+            filters = sorted({p.name.split('_fringe_')[1][:-len('.list')]
+                              for p in caldir.glob(f"{inst_settings['run']}_fringe_*.list")})
+            if not filters:
+                # No frames this night; the config may still supply a map.
+                filters = sorted(find_flat_filters(caldir, inst_settings['run']))
+                logger.info("No fringe frame lists; will look for a configured "
+                            "map for filter(s) %s", filters)
+            for filter in filters:
+                try:
+                    _ = make_master_calibration(
+                        "fringe", outdir, inst_settings['run'], instrument,
+                        config, filter=filter, config_dir=config_dir)
+                except Exception as e:
+                    logger.error("Failed to create fringe map for %s: %s", filter, e)
+                    raise
+        else:
+            logger.info("Skipping fringe map creation (to_make_fringe_map false)")
 
     # Make bad pixel map
     if proc_flags.get('to_make_bad_pixel_map', False):
@@ -829,16 +926,23 @@ def main():
         logger.debug("  Flat: %s", flat_file)
 
         try:
-            with fits.open(bias_file) as hdul:
-                master_bias = hdul[0].data
-            with fits.open(dark_file) as hdul:
-                master_dark = hdul[0].data
+            def _read_optional(path, label):
+                if not Path(path).exists():
+                    logger.info("No master %s for the bad pixel map; continuing "
+                                "without it", label)
+                    return None
+                with fits.open(path) as hdul:
+                    return hdul[0].data
+
+            master_bias = _read_optional(bias_file, "bias")
+            master_dark = _read_optional(dark_file, "dark")
             with fits.open(flat_file) as hdul:
                 master_flat = hdul[0].data
 
             # Create BPM with calibration frames
             bpm = make_bad_pixel_map(outdir, inst_settings['run'],
-                                     master_bias, master_dark, master_flat, config)
+                                     master_bias, master_dark, master_flat,
+                                     config, instrument=instrument)
 
             if bpm is not None:
                 logger.info("Bad pixel map created successfully")
@@ -878,14 +982,16 @@ def main():
                 targets_config = load_targets_config(config_dir)
                 logger.info("Targets configuration loaded successfully")
 
-                targets_to_process, initial_positions, tracking_stars = resolve_target_positions(config, targets_config,
-                                                                                                 all_targets)
+                (targets_to_process, initial_positions, tracking_stars,
+                 target_coords) = resolve_target_positions(
+                    config, targets_config, all_targets, instrument)
                 logger.info("Target positions resolved successfully")
             else:
                 # If not doing centroiding or photometry, process all targets
                 targets_to_process = sorted(all_targets)
                 initial_positions = None
                 tracking_stars = None
+                target_coords = [None] * len(targets_to_process)
 
             # Copy configuration files to log directory for record keeping
             copy_config_files(config_path, targets_config, targets_to_process, outdir, config)
@@ -906,12 +1012,24 @@ def main():
                     with open(list_file) as f:
                         first_filename = f.readline().strip()
 
-                    with fits.open(first_filename) as hdul:
-                        filter_name = hdul[0].header['FILTER']
+                    filter_name = instrument.read_meta(first_filename).filter
 
                     # Load calibration frames
                     from streaming_processor import load_calibration_frames, process_images_streaming
-                    calib_frames = load_calibration_frames(outdir, inst_settings['run'], filter_name, calib_params)
+                    calib_frames = load_calibration_frames(
+                        instrument, outdir, inst_settings['run'], filter_name)
+                    fringe_template = None
+                    if 'fringe' in instrument.steps:
+                        from master_calibrations import load_fringe_map
+                        fringe_path = (caldir /
+                                       f"{inst_settings['run']}_fringe_map_{filter_name}.fits")
+                        fringe_template = load_fringe_map(
+                            fringe_path, instrument, filter_name,
+                            expected_shape=calib_frames['flat'].shape
+                            if 'flat' in calib_frames else None)
+                    reducer = Reducer(instrument, calib_frames,
+                                      bad_pixel_map=bpm,
+                                      fringe_template=fringe_template)
 
                     # Prepare parameters
                     initial_position = initial_positions[i]
@@ -939,10 +1057,11 @@ def main():
                         save_processed_images = config.get('save_processed_images_streaming', False)
 
                         successful_images, failed_images = process_images_streaming(
-                            outdir, inst_settings['run'], target, config, calib_frames,
-                            initial_position, centroid_params, photometry_params,
-                            bad_pixel_map=bpm,  # ADD THIS LINE
-                            save_processed_images=save_processed_images
+                            instrument, reducer, outdir, inst_settings['run'],
+                            target, config, initial_position, centroid_params,
+                            photometry_params, bad_pixel_map=bpm,
+                            save_processed_images=save_processed_images,
+                            target_coord=target_coords[i]
                         )
                         logger.info(f"Streaming processing completed for {target}: {successful_images} successful")
                         if failed_images:
@@ -959,7 +1078,23 @@ def main():
                     if proc_flags['to_reduce_science_images']:
                         logger.info(f"Performing reduction for target {target}")
                         try:
-                            _ = reduce_science_frames(outdir, inst_settings['run'], target, bpm)
+                            seq_filter = instrument.read_meta(
+                                _first_science_file(outdir, inst_settings['run'],
+                                                    target)).filter
+                            from streaming_processor import load_calibration_frames
+                            seq_calib = load_calibration_frames(
+                                instrument, outdir, inst_settings['run'], seq_filter)
+                            seq_fringe = None
+                            if 'fringe' in instrument.steps:
+                                from master_calibrations import load_fringe_map
+                                seq_fringe = load_fringe_map(
+                                    caldir / f"{inst_settings['run']}_fringe_map_{seq_filter}.fits",
+                                    instrument, seq_filter)
+                            seq_reducer = Reducer(instrument, seq_calib,
+                                                  bad_pixel_map=bpm,
+                                                  fringe_template=seq_fringe)
+                            _ = reduce_science_frames(instrument, seq_reducer, outdir,
+                                                      inst_settings['run'], target)
                             logger.info(f"Science frame reduction completed for {target}")
                         except Exception as e:
                             logger.error(f"Failed to reduce science frames for {target}: {e}")
@@ -974,7 +1109,8 @@ def main():
                                      f"tracking_star={tracking_star}, flux_threshold={centroid_settings['flux_above_value']}")
                         try:
                             from centroid import centroid
-                            centroid(outdir, inst_settings['run'], target, initial_position,
+                            centroid(instrument, outdir, inst_settings['run'],
+                                     target, initial_position,
                                      centroid_settings['boxsize'],
                                      centroid_settings['nlimit_centroid'],
                                      centroid_settings['clip_centroid'],
@@ -982,7 +1118,8 @@ def main():
                                      tracking_star,
                                      centroid_settings['flux_above_value'],
                                      mask_centroid_pixels=centroid_settings['mask_centroid_pixels'],
-                                     bad_pixel_map=bpm)
+                                     bad_pixel_map=bpm,
+                                     target_coord=target_coords[i])
                             logger.info(f"Centroiding completed for {target}")
                         except Exception as e:
                             logger.error(f"Failed to perform centroiding for {target}: {e}")
@@ -1032,7 +1169,8 @@ def main():
             # Load targets config to resolve which targets to process
             config_dir = Path(config_path).parent
             targets_config = load_targets_config(config_dir)
-            targets_to_process, _, _ = resolve_target_positions(config, targets_config, all_targets)
+            targets_to_process, _, _, _ = resolve_target_positions(
+                config, targets_config, all_targets, instrument)
 
             for target in targets_to_process:
                 logger.info("Running analysis for target %s", target)

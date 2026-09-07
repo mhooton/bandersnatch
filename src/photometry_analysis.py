@@ -457,6 +457,47 @@ def optimize_comparison_stars(target_flux, target_flux_err, comparison_flux, com
     return good_comparisons, diff_flux, diff_flux_err, good_star_mask
 
 
+def _frame_metadata(outdir, target, file_paths):
+    """Exposure times and altitudes for the given frames.
+
+    Read from the per-target ``frames.fits`` written during reduction.  Older
+    runs predate that table, so fall back to reading the frames themselves.
+    """
+    frames_file = Path(outdir) / target / "frames.fits"
+    if frames_file.exists():
+        try:
+            table = Table.read(frames_file)
+            by_file = {str(row["file"]): row for row in table}
+            exp_times, altitudes = [], []
+            for path in file_paths:
+                row = by_file.get(str(path))
+                if row is None:
+                    continue
+                alt = row["altitude"] if "altitude" in table.colnames else np.nan
+                if not np.isfinite(alt):
+                    continue
+                exp_times.append(float(row["exptime"]))
+                altitudes.append(float(alt))
+            if exp_times:
+                logger.debug("Read %d frame metadata rows from %s",
+                             len(exp_times), frames_file)
+                return exp_times, altitudes
+            logger.warning("%s has no usable altitude values", frames_file)
+        except Exception as exc:
+            logger.warning("Could not read %s: %s", frames_file, exc)
+
+    logger.debug("Falling back to reading frame headers directly")
+    exp_times, altitudes = [], []
+    for path in file_paths:
+        try:
+            with fits.open(path) as hdul:
+                exp_times.append(hdul[0].header["EXPTIME"])
+                altitudes.append(hdul[0].header["ALTITUDE"])
+        except Exception as exc:
+            logger.warning("Could not read headers from %s: %s", path, exc)
+    return exp_times, altitudes
+
+
 def calculate_precision_metrics(aperture_tables, config, outdir, target):
     """
     Calculate theoretical photometric precision for all apertures and stars.
@@ -522,18 +563,9 @@ def calculate_precision_metrics(aperture_tables, config, outdir, target):
         file_paths_final = list(table['File'])
         n_images, n_stars = flux_final.shape
 
-        # Read headers to get exposure time and altitude
-        exp_times = []
-        altitudes = []
-
-        for file_path in file_paths_final:
-            try:
-                # Handle Docker path translation if needed
-                with fits.open(file_path) as hdul:
-                    exp_times.append(hdul[0].header['EXPTIME'])
-                    altitudes.append(hdul[0].header['ALTITUDE'])
-            except Exception as e:
-                logger.warning("Could not read headers from %s: %s", file_path, e)
+        # Exposure time and altitude come from the per-frame table written
+        # during reduction, so no raw file is reopened here.
+        exp_times, altitudes = _frame_metadata(outdir, target, file_paths_final)
 
         if not exp_times or not altitudes:
             logger.warning("Could not calculate precision for aperture %s: no valid headers", aper_name)

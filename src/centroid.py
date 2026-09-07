@@ -795,8 +795,9 @@ def centroid_loop(star_x_input, star_y_input, boxsize, nlimit_centroid, clip_cen
     }
 
 
-def centroid(outdir, run, target, initial_positions, boxsize, nlimit, clip, sky_sigma,
-             tracking_star, flux_above_value, mask_centroid_pixels=None, bad_pixel_map=None):
+def centroid(instrument, outdir, run, target, initial_positions, boxsize, nlimit,
+             clip, sky_sigma, tracking_star, flux_above_value,
+             mask_centroid_pixels=None, bad_pixel_map=None, target_coord=None):
     """
     Perform centroiding on all processed images for a given target.
 
@@ -886,42 +887,36 @@ def centroid(outdir, run, target, initial_positions, boxsize, nlimit, clip, sky_
 
         try:
             image_path = outdir / target / run / filename
+            meta = instrument.read_processed(image_path)
             with fits.open(image_path) as hdul:
                 image = hdul[0].data.astype(np.float64)
-                header = hdul[0].header
-
-                # Extract BJD from header
-                bjd_obs = header.get('BJD-OBS', 0.0)
-                if bjd_obs == 0.0:
-                    bjd_obs = header.get('MJD-OBS', 0.0)
-                if bjd_obs == 0.0:
-                    logger.warning("No BJD-OBS found in header for %s, using image index", filename)
-                    bjd_obs = float(i)
-
-                # Extract AIRMASS - ADD THESE LINES
-                airmass_obs = extract_airmass(header)
-
-                if bad_pixel_map is not None:
-                    n_bad_pixels_in_box_frame = np.zeros(len(star_x_input), dtype=int)
-                    for star_num in range(len(star_x_input)):
-                        x_center = results['xc'][star_num]
-                        y_center = results['yc'][star_num]
-
-                        x_min = max(0, int(x_center - boxsize / 2))
-                        x_max = min(image.shape[1], int(x_center + boxsize / 2))
-                        y_min = max(0, int(y_center - boxsize / 2))
-                        y_max = min(image.shape[0], int(y_center + boxsize / 2))
-
-                        box_bpm = bad_pixel_map[y_min:y_max, x_min:x_max]
-                        n_bad_pixels_in_box_frame[star_num] = np.sum(box_bpm)
-                    n_bad_pixels_in_box.append(n_bad_pixels_in_box_frame)
-                else:
-                    n_bad_pixels_in_box.append(np.zeros(len(star_x_input), dtype=int))
+            header = meta.header
+            bjd_obs = instrument.compute_bjd(meta, target_coord)
+            airmass_obs = meta.airmass
 
             # Call centroid_loop for this image
             results = centroid_loop(star_x_input, star_y_input, boxsize, nlimit,
                                     clip, sky_sigma, tracking_star, flux_above_value,
                                     image=image, header=header, mask_centroid_pixels=mask_centroid_pixels)
+
+            # Count bad pixels in each star's box. This must follow
+            # centroid_loop, which is what produces the positions it uses.
+            if bad_pixel_map is not None:
+                n_bad_pixels_in_box_frame = np.zeros(len(star_x_input), dtype=int)
+                for star_num in range(len(star_x_input)):
+                    x_center = results['xc'][star_num]
+                    y_center = results['yc'][star_num]
+
+                    x_min = max(0, int(x_center - boxsize / 2))
+                    x_max = min(image.shape[1], int(x_center + boxsize / 2))
+                    y_min = max(0, int(y_center - boxsize / 2))
+                    y_max = min(image.shape[0], int(y_center + boxsize / 2))
+
+                    box_bpm = bad_pixel_map[y_min:y_max, x_min:x_max]
+                    n_bad_pixels_in_box_frame[star_num] = np.sum(box_bpm)
+                n_bad_pixels_in_box.append(n_bad_pixels_in_box_frame)
+            else:
+                n_bad_pixels_in_box.append(np.zeros(len(star_x_input), dtype=int))
 
             # Append results to lists
             xc.append(results['xc'])
