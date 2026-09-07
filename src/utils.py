@@ -131,7 +131,12 @@ def medabsdevclip(data, clip, nlimit):
         return output
 
     elif data_ndim == 3:
-        # 3D cube
+        # 3D cube: clip along the stack axis, one output pixel per (row, col).
+        #
+        # Vectorised in row chunks. The previous implementation looped in
+        # Python over every pixel at about 29 us each: four minutes per master
+        # frame for a 4096x2048 INT/WFC chip, against a fraction of a second
+        # here. The arithmetic is unchanged, so results are identical.
         if not isinstance(clip, (int, float)):
             clip = 5
             logger.warning("Invalid clip parameter, using default: %.1f", clip)
@@ -143,63 +148,47 @@ def medabsdevclip(data, clip, nlimit):
         logger.info("Processing 3D cube: %dx%dx%d, clip=%.1f, nlimit=%d",
                     nx, ny, nz, clip, nlimit)
 
-        # Define output frame
+        # How many of the lowest values survive the trim. A negative count is
+        # Python's "all but the last |count|", which the original slice
+        # argsort(line)[:nz - nlimit - 1] relied on.
+        if nlimit >= 0:
+            count = nz - int(nlimit) - 1
+            if count < 0:
+                count = nz + count
+        else:
+            count = nz
+        if count <= 0:
+            # The original produced an all-NaN frame here, which then
+            # propagated silently through every later stage. Stop instead.
+            raise ValueError(
+                f"nlimit={nlimit} leaves no values to combine from a stack of "
+                f"{nz} frames. Reduce nlimit (it discards the nlimit+1 highest "
+                f"values per pixel) or supply more frames.")
+
         master_frame = np.zeros((nx, ny), dtype=float)
-        n_pixels = np.zeros(nx * ny, dtype=int)
 
-        # Track processing progress for large cubes
-        total_pixels = nx * ny
-        log_interval = max(1, total_pixels // 10)  # Log every 10% of progress
+        bytes_per_row = ny * nz * 8
+        rows_per_chunk = max(1, min(nx, int(256e6 // max(bytes_per_row * 4, 1))))
+        logger.debug("Vectorised clipping in chunks of %d rows", rows_per_chunk)
 
-        # Process each pixel across the z-dimension
-        processed_count = 0
-        for i in range(nx):
-            for j in range(ny):
-                # Extract 1D line along z axis
-                line = data[i, j, :]
+        for start_row in range(0, nx, rows_per_chunk):
+            stop_row = min(start_row + rows_per_chunk, nx)
+            block = np.asarray(data[start_row:stop_row], dtype=float)
 
-                if nlimit >= 0:
-                    # Sort the line
-                    s1 = np.argsort(line)
-                    trimmed_line = line[s1[:nz - nlimit - 1]]
-                    sig, med = mad(trimmed_line, sigma=True), np.median(trimmed_line)
-                    n_pixels_used = len(trimmed_line)
-                else:
-                    sig, med = mad(line, sigma=True), np.median(line)
-                    n_pixels_used = len(line)
+            trimmed = np.sort(block, axis=2)[:, :, :count]
+            med = np.median(trimmed, axis=2)
+            sig = np.median(np.abs(trimmed - med[:, :, None]), axis=2) * 1.5
 
-                # Handle division by zero
-                if sig == 0:
-                    sig = 1e-10
-
-                # Store the number of pixels used - FIXED INDEXING
-                n_pixels[i * ny + j] = n_pixels_used
-
-                # Find values within clip limit
-                w_g = np.where(np.abs(line - med) / sig <= clip)[0]
-
-                # Calculate and store mean of good values
-                if len(w_g) > 0:
-                    master_frame[i, j] = np.mean(line[w_g])
-                else:
-                    master_frame[i, j] = med  # Fallback if no good values
-
-                processed_count += 1
-
-                # Log progress for large cubes
-                if processed_count % log_interval == 0:
-                    progress = 100 * processed_count / total_pixels
-                    logger.debug("3D processing progress: %.1f%% (%d/%d pixels)",
-                                 progress, processed_count, total_pixels)
+            sig = np.where(sig == 0, 1e-10, sig)
+            good = np.abs(block - med[:, :, None]) / sig[:, :, None] <= clip
+            n_good = good.sum(axis=2)
+            total = np.where(good, block, 0.0).sum(axis=2)
+            master_frame[start_row:stop_row] = np.where(
+                n_good > 0, total / np.maximum(n_good, 1), med)
 
         logger.info("3D cube processing completed: %dx%d output frame", nx, ny)
-
-        # Log some statistics about the final frame
-        final_median = np.median(master_frame)
-        final_std = np.std(master_frame)
         logger.debug("Final 3D frame statistics: median=%.3f, std=%.3f",
-                     final_median, final_std)
-
+                     np.median(master_frame), np.std(master_frame))
         return master_frame
 
     else:
@@ -275,8 +264,8 @@ def find_flat_filters(directory, run):
     # Define the regex pattern to match both old and new style flat lists
     # Old style: {run}_flat_{filter}.list
     # New style: {run}_flat_{filter}_dawn.list and {run}_flat_{filter}_dusk.list
-    old_pattern = re.compile(f"^{re.escape(run)}_flat_(.+)\.list$")
-    new_pattern = re.compile(f"^{re.escape(run)}_flat_(.+)_(dawn|dusk)\.list$")
+    old_pattern = re.compile(rf"^{re.escape(run)}_flat_(.+)\.list$")
+    new_pattern = re.compile(rf"^{re.escape(run)}_flat_(.+)_(dawn|dusk)\.list$")
 
     # Set to store unique filter names
     filters = set()

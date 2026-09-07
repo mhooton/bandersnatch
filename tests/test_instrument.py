@@ -554,3 +554,72 @@ def test_build_fringe_map_rejects_dithered_stars():
     m = reduction.build_fringe_map(frames, highpass_sigma=0)
     assert m.max() < 100.0                          # star gone
     assert np.corrcoef(m.ravel(), truth.ravel())[0, 1] > 0.99
+
+
+# ----------------------------------------------------- clipped combination
+
+def _medabsdevclip_reference(data, clip, nlimit):
+    """The per-pixel Python loop that the vectorised version replaced."""
+    from utils import mad
+    nx, ny, nz = data.shape
+    out = np.zeros((nx, ny))
+    for i in range(nx):
+        for j in range(ny):
+            line = data[i, j, :]
+            if nlimit >= 0:
+                s1 = np.argsort(line)
+                trimmed = line[s1[:nz - nlimit - 1]]
+                sig, med = mad(trimmed, sigma=True), np.median(trimmed)
+            else:
+                sig, med = mad(line, sigma=True), np.median(line)
+            if sig == 0:
+                sig = 1e-10
+            w = np.where(np.abs(line - med) / sig <= clip)[0]
+            out[i, j] = np.mean(line[w]) if len(w) else med
+    return out
+
+
+@pytest.mark.parametrize("shape,clip,nlimit", [
+    ((30, 25, 9), 5, 5),
+    ((20, 20, 21), 3, 5),
+    ((15, 15, 5), 5, 0),
+    ((12, 12, 4), 5, 5),      # nlimit > nz: the negative-count slice
+    ((10, 10, 8), 2, -1),     # nlimit < 0: no trim at all
+])
+def test_medabsdevclip_matches_the_original_loop(shape, clip, nlimit):
+    """Vectorising must not change the numbers, only the speed."""
+    from utils import medabsdevclip
+    rng = np.random.default_rng(7)
+    cube = rng.normal(100, 5, shape)
+    cube[3, 3, :2] += 900          # a couple of outliers to clip
+    cube[5, 5, 0] -= 400
+    expected = _medabsdevclip_reference(cube, clip, nlimit)
+    got = medabsdevclip(cube, clip, nlimit)
+    # Summation order differs, so agreement is to float64 rounding, not bitwise.
+    assert np.allclose(got, expected, rtol=1e-12, atol=0)
+
+
+def test_medabsdevclip_rejects_an_impossible_trim():
+    """nlimit >= nz used to yield an all-NaN master frame, silently."""
+    from utils import medabsdevclip
+    rng = np.random.default_rng(1)
+    with pytest.raises(ValueError, match="leaves no values to combine"):
+        medabsdevclip(rng.normal(0, 1, (4, 4, 6)), 5, 5)
+
+
+def test_medabsdevclip_clips_a_planted_outlier():
+    from utils import medabsdevclip
+    rng = np.random.default_rng(2)
+    cube = rng.normal(50.0, 0.5, (8, 8, 15))
+    cube[4, 4, 7] = 5000.0
+    out = medabsdevclip(cube, 3, 0)
+    assert out[4, 4] == pytest.approx(50.0, abs=1.0)
+
+
+def test_medabsdevclip_2d_returns_mean_and_std():
+    from utils import medabsdevclip
+    rng = np.random.default_rng(3)
+    out = medabsdevclip(rng.normal(10.0, 2.0, (60, 60)), 5, 0)
+    assert out.shape == (2,)
+    assert out[0] == pytest.approx(10.0, abs=0.1)
+    assert out[1] == pytest.approx(2.0, abs=0.1)
