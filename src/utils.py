@@ -228,7 +228,7 @@ def find_targets(directory, run):
 
     # Define the regex pattern to match {run}_image_{target}.list
     # The pattern captures the target portion as a group
-    pattern = re.compile(f"^{re.escape(run)}_image_(.+)\.list$")
+    pattern = re.compile(rf"^{re.escape(run)}_image_(.+)\.list$")
 
     # List to store extracted target names
     targets = []

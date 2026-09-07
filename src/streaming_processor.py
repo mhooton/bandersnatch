@@ -10,7 +10,7 @@ from astropy.table import Table
 # Import existing functions
 from reduce_science import overscan_corr, apply_calibrations
 from centroid import centroid_loop, extract_airmass, write_centroiding_results
-from photometry import translate_path_for_docker, count_bad_pixels_in_apertures, write_photometry_results
+from photometry import count_bad_pixels_in_apertures, write_photometry_results
 from aper import aper
 
 logger = logging.getLogger(__name__)

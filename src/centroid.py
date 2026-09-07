@@ -893,6 +893,8 @@ def centroid(outdir, run, target, initial_positions, boxsize, nlimit, clip, sky_
                 # Extract BJD from header
                 bjd_obs = header.get('BJD-OBS', 0.0)
                 if bjd_obs == 0.0:
+                    bjd_obs = header.get('MJD-OBS', 0.0)
+                if bjd_obs == 0.0:
                     logger.warning("No BJD-OBS found in header for %s, using image index", filename)
                     bjd_obs = float(i)
 

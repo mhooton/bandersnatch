@@ -529,9 +529,7 @@ def calculate_precision_metrics(aperture_tables, config, outdir, target):
         for file_path in file_paths_final:
             try:
                 # Handle Docker path translation if needed
-                from photometry import translate_path_for_docker
-                translated_path = translate_path_for_docker(file_path, outdir)
-                with fits.open(translated_path) as hdul:
+                with fits.open(file_path) as hdul:
                     exp_times.append(hdul[0].header['EXPTIME'])
                     altitudes.append(hdul[0].header['ALTITUDE'])
             except Exception as e:

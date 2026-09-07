@@ -4,7 +4,6 @@ import os
 import logging
 import shutil
 from astropy.io import fits
-from liris import runset_filter
 from utils import medabsdevclip
 from pathlib import Path
 import yaml
@@ -93,18 +92,12 @@ def calculate_readout_noise(filenames, image_extension, gain, subtract_overscan=
         return 0.0
 
 
-def process_flat_session(filenames, run, outdir, filter, instrument, runset_cut, image_extension,
+def process_flat_session(filenames, run, outdir, filter, instrument, image_extension,
                          subtract_overscan, overscan_first_column, overscan_last_column,
                          clip, nlimit, session_name):
     """Process a single flat field session (dawn or dusk)"""
     logger.info("Processing %s session for filter %s", session_name, filter)
 
-    # Filter LIRIS data if needed
-    if instrument == 'LIRIS':
-        original_count = len(filenames)
-        filenames = runset_filter(filenames, runset_cut)
-        if len(filenames) != original_count:
-            logger.info("LIRIS runset filter: %d -> %d files", original_count, len(filenames))
 
     if not filenames:
         logger.warning("No files found for %s session", session_name)
@@ -267,7 +260,6 @@ def find_backup_flat_for_date(master_flats_config, filter_name, observation_date
         return None
 
 def make_master_calibration(type, outdir, run, instrument, config, filter="zYJ", subtract_overscan=False,
-                            runset_cut=None,
                             image_extension=0, overscan_first_column=None, overscan_last_column=None,
                             overscan_first_column2=None, overscan_last_column2=None, clip=5, nlimit=5):
     logger.info("Creating master %s calibration", type)
@@ -380,7 +372,7 @@ def make_master_calibration(type, outdir, run, instrument, config, filter="zYJ",
 
             if dawn_filenames:
                 dawn_master = process_flat_session(
-                    dawn_filenames, run, outdir, filter, instrument, runset_cut,
+                    dawn_filenames, run, outdir, filter, instrument,
                     image_extension, subtract_overscan, overscan_first_column,
                     overscan_last_column, clip, nlimit, "dawn"
                 )
@@ -389,7 +381,7 @@ def make_master_calibration(type, outdir, run, instrument, config, filter="zYJ",
 
             if dusk_filenames:
                 dusk_master = process_flat_session(
-                    dusk_filenames, run, outdir, filter, instrument, runset_cut,
+                    dusk_filenames, run, outdir, filter, instrument,
                     image_extension, subtract_overscan, overscan_first_column,
                     overscan_last_column, clip, nlimit, "dusk"
                 )
@@ -416,12 +408,6 @@ def make_master_calibration(type, outdir, run, instrument, config, filter="zYJ",
             # Process old-style single list (original behavior)
             logger.info("Processing %d flat files using old-style method", len(filenames))
 
-            # Filter LIRIS data if needed
-            if instrument == 'LIRIS':
-                original_count = len(filenames)
-                filenames = runset_filter(filenames, runset_cut)
-                if len(filenames) != original_count:
-                    logger.info("LIRIS runset filter: %d -> %d files", original_count, len(filenames))
 
             n_files = len(filenames)
 
@@ -535,12 +521,6 @@ def make_master_calibration(type, outdir, run, instrument, config, filter="zYJ",
             except Exception as e:
                 logger.error("Failed to save readout noise file: %s", e)
 
-        # Filter LIRIS data if needed
-        if instrument == 'LIRIS':
-            original_count = len(filenames)
-            filenames = runset_filter(filenames, runset_cut)
-            if len(filenames) != original_count:
-                logger.info("LIRIS runset filter: %d -> %d files", original_count, len(filenames))
 
         n_files = len(filenames)
 
