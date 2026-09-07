@@ -697,6 +697,30 @@ it, and why.
   2.2e-16. The only source of that difference is summation order in the
   vectorised stack combination.
 - **INT/WFC end to end**: the real night of 2017-08-05, 514 frames, chip 4.
+  Every check against an independent measurement passed:
+
+  | Quantity | Pipeline | Independent measurement |
+  |---|---|---|
+  | KELT-16 position, trimmed | (210.1, 1926.0) | (210, 1925) from the Gaia plate solve |
+  | Fringe template amplitude | 3.10 ADU robust std | 3.5 ADU |
+  | Fringe scale through the night | 0.60 to 2.09, smoothly | 0.7 to 2.1, rising |
+  | Bias drift across the night | 36 ADU | 10 to 50 ADU |
+  | Airmass range | 1.00 to 1.97 | 1.00 to 1.97 |
+
+  The fitted fringe scale correlates with the recorded sky level at +0.71 and
+  varies smoothly frame to frame, which is the behaviour expected of OH
+  airglow and evidence the fit is tracking signal rather than noise.
+
+- **Does the fringe step earn its place?** The same night was reduced again
+  with `fringe` removed from the recipe and nothing else changed. The best
+  aperture improves from 1.381 to 1.325 parts per thousand, about 4 per cent,
+  and the gain is concentrated at the larger apertures (5 to 7 per cent at
+  r = 17 to 19 px) where more fringed sky falls inside the aperture. Across
+  all apertures the median change is -1.1 per cent, with a few apertures
+  marginally worse within the noise. That is a real improvement of the
+  expected size and sign: the design-phase estimate of the uncorrected bias
+  was 0.1 to 0.3 mmag per star at the start of the night, against a
+  light-curve scatter of 1.4 mmag.
 
 ### Beyond the design
 
